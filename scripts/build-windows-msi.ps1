@@ -267,7 +267,7 @@ Write-WixDirectory `
 
 [void] $builder.AppendLine('        </Directory>')
 [void] $builder.AppendLine('      </Directory>')
-[void] $builder.AppendLine('      <Directory Id="ProgramMenuFolder">')
+[void] $builder.AppendLine('      <Directory Id="CommonProgramMenuFolder">')
 [void] $builder.AppendLine("        <Directory Id=`"ApplicationProgramsFolder`" Name=`"$productNameXml`" />")
 [void] $builder.AppendLine('      </Directory>')
 [void] $builder.AppendLine('    </Directory>')
