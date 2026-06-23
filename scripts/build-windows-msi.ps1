@@ -129,12 +129,13 @@ if (Test-Path -LiteralPath $workDir) {
 }
 New-Item -ItemType Directory -Path $workDir -Force | Out-Null
 
-$files = Get-ChildItem -LiteralPath $resolvedSourceDir -File -Recurse | Sort-Object FullName
+$files = @(Get-ChildItem -LiteralPath $resolvedSourceDir -File -Recurse | Sort-Object FullName)
 if ($files.Count -eq 0) {
     throw "No files found in source directory: $resolvedSourceDir"
 }
 
-$directories = Get-ChildItem -LiteralPath $resolvedSourceDir -Directory -Recurse | Sort-Object FullName
+$directories = @(Get-ChildItem -LiteralPath $resolvedSourceDir -Directory -Recurse | Sort-Object FullName)
+$allDirectoryPaths = @($resolvedSourceDir) + @($directories | ForEach-Object { $_.FullName })
 $directoryIds = @{}
 $directoryIds[$resolvedSourceDir] = "INSTALLFOLDER"
 
@@ -147,7 +148,7 @@ foreach ($directory in $directories) {
 $directoryChildren = @{}
 $fileChildren = @{}
 
-foreach ($directory in @($resolvedSourceDir) + $directories.FullName) {
+foreach ($directory in $allDirectoryPaths) {
     $directoryChildren[$directory] = New-Object System.Collections.Generic.List[string]
     $fileChildren[$directory] = New-Object System.Collections.Generic.List[System.IO.FileInfo]
 }
