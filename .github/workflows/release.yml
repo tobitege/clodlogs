@@ -58,6 +58,7 @@ jobs:
 
           PACKAGE_VERSION=$(node -p "require('./package.json').version")
           APP_VERSION=$(node -e "const fs = require('fs'); const match = fs.readFileSync('electrobun.config.ts', 'utf8').match(/version:\\s*['\\\"]([^'\\\"]+)['\\\"]/); if (!match) { console.error('Could not find app version in electrobun.config.ts.'); process.exit(1); } console.log(match[1]);")
+          DESKTOP_VERSION=$(node -e "const fs = require('fs'); const match = fs.readFileSync('src/Clodlogs.Desktop/Clodlogs.Desktop.csproj', 'utf8').match(/<Version>([^<]+)<\\/Version>/); if (!match) { console.error('Could not find desktop app version in Clodlogs.Desktop.csproj.'); process.exit(1); } console.log(match[1]);")
 
           if [ "$PACKAGE_VERSION" != "$VERSION" ]; then
             echo "::error::package.json has version $PACKAGE_VERSION but workflow input was $VERSION."
@@ -66,6 +67,11 @@ jobs:
 
           if [ "$APP_VERSION" != "$VERSION" ]; then
             echo "::error::electrobun.config.ts has version $APP_VERSION but workflow input was $VERSION."
+            exit 1
+          fi
+
+          if [ "$DESKTOP_VERSION" != "$VERSION" ]; then
+            echo "::error::Clodlogs.Desktop.csproj has version $DESKTOP_VERSION but workflow input was $VERSION."
             exit 1
           fi
 
@@ -92,6 +98,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.x"
 
       - uses: actions/setup-node@v6
         with:
@@ -135,6 +145,29 @@ jobs:
       - name: Build stable Windows desktop bundle
         run: bunx electrobun build --env=stable
 
+      - name: Build Avalonia desktop app
+        shell: pwsh
+        run: dotnet build Clodlogs.sln -c Release
+
+      - name: Test Avalonia desktop app
+        shell: pwsh
+        run: dotnet run --project src\Clodlogs.Desktop.Tests\Clodlogs.Desktop.Tests.csproj -c Release
+
+      - name: Publish Avalonia desktop app
+        shell: pwsh
+        run: |
+          $publishDir = Join-Path $env:GITHUB_WORKSPACE 'artifacts\clodlogs-desktop-win-x64'
+
+          dotnet publish src\Clodlogs.Desktop\Clodlogs.Desktop.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:PublishTrimmed=false `
+            -p:DebugType=None `
+            -p:DebugSymbols=false `
+            -o $publishDir
+
       - name: Install WiX Toolset
         shell: pwsh
         run: choco install wixtoolset --no-progress --yes
@@ -142,14 +175,15 @@ jobs:
       - name: Build Windows MSI
         shell: pwsh
         run: |
-          $sourceDir = Join-Path $env:GITHUB_WORKSPACE 'build\stable-win-x64\clodlogs'
+          $sourceDir = Join-Path $env:GITHUB_WORKSPACE 'artifacts\clodlogs-desktop-win-x64'
           $outputPath = Join-Path $env:GITHUB_WORKSPACE 'artifacts\clodlogs-${{ needs.validate.outputs.version }}-windows-x64.msi'
           $scriptPath = Join-Path $env:GITHUB_WORKSPACE 'scripts\build-windows-msi.ps1'
 
           & $scriptPath `
             -SourceDir $sourceDir `
             -OutputPath $outputPath `
-            -Version '${{ needs.validate.outputs.version }}'
+            -Version '${{ needs.validate.outputs.version }}' `
+            -ShortcutTarget 'Clodlogs.Desktop.exe'
 
       - name: Upload desktop release artifacts
         uses: actions/upload-artifact@v7

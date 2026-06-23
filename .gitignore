@@ -5,6 +5,8 @@ node_modules/
 dist/
 build/
 out/
+bin/
+obj/
 
 # TypeScript and tooling caches
 *.tsbuildinfo

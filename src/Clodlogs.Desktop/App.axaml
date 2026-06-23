@@ -1,0 +1,25 @@
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="Clodlogs.Desktop.App"
+             RequestedThemeVariant="Light">
+  <Application.Styles>
+    <FluentTheme />
+  </Application.Styles>
+
+  <Application.Resources>
+    <Color x:Key="AppBackgroundColor">#F7F0E3</Color>
+    <Color x:Key="PanelBackgroundColor">#FDF9F1</Color>
+    <Color x:Key="CardBackgroundColor">#FFFFFF</Color>
+    <Color x:Key="TextColor">#1E2430</Color>
+    <Color x:Key="MutedTextColor">#5E6572</Color>
+    <Color x:Key="AccentColor">#B0522F</Color>
+    <Color x:Key="SecondaryColor">#357B84</Color>
+    <SolidColorBrush x:Key="AppBackgroundBrush" Color="{DynamicResource AppBackgroundColor}" />
+    <SolidColorBrush x:Key="PanelBackgroundBrush" Color="{DynamicResource PanelBackgroundColor}" />
+    <SolidColorBrush x:Key="CardBackgroundBrush" Color="{DynamicResource CardBackgroundColor}" />
+    <SolidColorBrush x:Key="TextBrush" Color="{DynamicResource TextColor}" />
+    <SolidColorBrush x:Key="MutedTextBrush" Color="{DynamicResource MutedTextColor}" />
+    <SolidColorBrush x:Key="AccentBrush" Color="{DynamicResource AccentColor}" />
+    <SolidColorBrush x:Key="SecondaryBrush" Color="{DynamicResource SecondaryColor}" />
+  </Application.Resources>
+</Application>

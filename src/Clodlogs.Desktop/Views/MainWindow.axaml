@@ -1,0 +1,414 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:Clodlogs.Desktop.ViewModels"
+        x:Class="Clodlogs.Desktop.Views.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Title="clodlogs"
+        Width="1600"
+        Height="1000"
+        MinWidth="980"
+        MinHeight="720"
+        WindowStartupLocation="CenterScreen"
+        Background="{DynamicResource AppBackgroundBrush}">
+  <Window.Styles>
+    <Style Selector="TextBlock">
+      <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />
+    </Style>
+    <Style Selector="TextBlock.muted">
+      <Setter Property="Foreground" Value="{DynamicResource MutedTextBrush}" />
+      <Setter Property="FontSize" Value="12" />
+    </Style>
+    <Style Selector="TextBlock.kicker">
+      <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
+      <Setter Property="FontSize" Value="11" />
+      <Setter Property="FontWeight" Value="Bold" />
+    </Style>
+    <Style Selector="Border.panel">
+      <Setter Property="Background" Value="{DynamicResource PanelBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="#2463523A" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="12" />
+    </Style>
+    <Style Selector="Border.card">
+      <Setter Property="Background" Value="{DynamicResource CardBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="#2463523A" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="8" />
+      <Setter Property="Padding" Value="12" />
+    </Style>
+    <Style Selector="Button">
+      <Setter Property="Padding" Value="14,8" />
+      <Setter Property="CornerRadius" Value="8" />
+    </Style>
+    <Style Selector="Button.primary">
+      <Setter Property="Background" Value="{DynamicResource AccentBrush}" />
+      <Setter Property="Foreground" Value="White" />
+    </Style>
+    <Style Selector="Button.ghost">
+      <Setter Property="Background" Value="#60FFFFFF" />
+      <Setter Property="BorderBrush" Value="#2463523A" />
+      <Setter Property="BorderThickness" Value="1" />
+    </Style>
+    <Style Selector="ListBox.session-list">
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderThickness" Value="0" />
+    </Style>
+    <Style Selector="ListBoxItem">
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="Margin" Value="0,0,0,8" />
+      <Setter Property="Background" Value="Transparent" />
+    </Style>
+    <Style Selector="TextBox">
+      <Setter Property="CornerRadius" Value="8" />
+      <Setter Property="MinHeight" Value="34" />
+    </Style>
+    <Style Selector="CheckBox">
+      <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />
+    </Style>
+  </Window.Styles>
+
+  <Grid RowDefinitions="Auto,Auto,*,Auto" Margin="20" RowSpacing="14">
+    <Grid ColumnDefinitions="*,Auto" ColumnSpacing="20">
+      <StackPanel>
+        <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
+          <TextBlock Text="clodlogs" FontSize="42" FontFamily="Georgia" FontWeight="Bold" />
+          <Button Classes="ghost" Content="GitHub" Command="{CompiledBinding OpenRepositoryCommand}" />
+        </StackPanel>
+        <TextBlock Classes="muted" Text="Browse Claude session logs, inspect transcripts, export sessions, and create sanitized copies." />
+      </StackPanel>
+      <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
+        <Border Classes="card">
+          <StackPanel>
+            <TextBlock Classes="kicker" Text="SESSIONS" />
+            <TextBlock Text="{CompiledBinding SessionCountText}" FontSize="22" FontWeight="Bold" />
+            <TextBlock Classes="muted" Text="{CompiledBinding ScopeText}" />
+          </StackPanel>
+        </Border>
+        <Border Classes="card">
+          <StackPanel>
+            <TextBlock Classes="kicker" Text="SIZE" />
+            <TextBlock Text="{CompiledBinding TotalSizeText}" FontSize="22" FontWeight="Bold" />
+            <TextBlock Classes="muted" Text="{CompiledBinding LiveCountText}" />
+          </StackPanel>
+        </Border>
+      </StackPanel>
+    </Grid>
+
+    <Border Grid.Row="1" Classes="panel" Padding="14">
+      <Grid RowDefinitions="Auto,Auto,Auto" RowSpacing="10">
+        <Grid ColumnDefinitions="2*,Auto,Auto,Auto" ColumnSpacing="8">
+          <TextBox PlaceholderText="Filter sessions by title, folder, or kind..." Text="{CompiledBinding SearchQuery, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+          <Button Grid.Column="1" Classes="ghost" Content="Browse Folder" Command="{CompiledBinding BrowseFolderCommand}" />
+          <Button Grid.Column="2" Classes="ghost" Content="All Sessions" Command="{CompiledBinding ShowAllSessionsCommand}" />
+          <Button Grid.Column="3" Classes="primary" Content="Refresh" Command="{CompiledBinding RefreshCommand}" />
+        </Grid>
+        <Grid Grid.Row="1" ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
+          <TextBox PlaceholderText="Claude home override" Text="{CompiledBinding ClaudeHome, Mode=TwoWay}" />
+          <TextBox Grid.Column="1" Width="220" PlaceholderText="Folder path" Text="{CompiledBinding FolderPath, Mode=TwoWay}" />
+          <Button Grid.Column="2" Classes="ghost" Content="Token Summary" Command="{CompiledBinding OpenTokenSummaryCommand}" />
+        </Grid>
+        <WrapPanel Grid.Row="2">
+          <CheckBox Content="CWD only" IsChecked="{CompiledBinding CwdOnly, Mode=TwoWay}" />
+          <CheckBox Content="Include cross-session writes" IsChecked="{CompiledBinding IncludeCrossSessionWrites, Mode=TwoWay}" />
+          <CheckBox Content="Live" IsChecked="{CompiledBinding ShowLiveSessions, Mode=TwoWay}" />
+          <CheckBox Content="Archived" IsChecked="{CompiledBinding ShowArchivedSessions, Mode=TwoWay}" />
+          <TextBlock Classes="muted" Text="From" VerticalAlignment="Center" />
+          <TextBox Width="130" PlaceholderText="yyyy-mm-dd" Text="{CompiledBinding DateFrom, Mode=TwoWay}" />
+          <TextBlock Classes="muted" Text="To" VerticalAlignment="Center" />
+          <TextBox Width="130" PlaceholderText="yyyy-mm-dd" Text="{CompiledBinding DateTo, Mode=TwoWay}" />
+        </WrapPanel>
+      </Grid>
+    </Border>
+
+    <Grid Grid.Row="2" ColumnDefinitions="390,*" ColumnSpacing="14">
+      <Border Classes="panel">
+        <Grid RowDefinitions="Auto,*">
+          <StackPanel Margin="14" Spacing="5">
+            <TextBlock Text="Sessions" FontSize="22" FontFamily="Georgia" FontWeight="Bold" />
+            <TextBlock Classes="muted" Text="{CompiledBinding ArchivedCountText}" />
+          </StackPanel>
+          <ListBox Grid.Row="1"
+                   Classes="session-list"
+                   ItemsSource="{CompiledBinding FilteredSessions}"
+                   SelectedItem="{CompiledBinding SelectedSession, Mode=TwoWay}"
+                   Padding="12">
+            <ListBox.ItemsPanel>
+              <ItemsPanelTemplate>
+                <VirtualizingStackPanel />
+              </ItemsPanelTemplate>
+            </ListBox.ItemsPanel>
+            <ListBox.ItemTemplate>
+              <DataTemplate x:DataType="vm:SessionCardViewModel">
+                <Border Classes="card">
+                  <Grid RowDefinitions="Auto,Auto,Auto" RowSpacing="5">
+                    <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="8">
+                      <Border Background="#22357B84" CornerRadius="5" Padding="6,3">
+                        <TextBlock Text="{CompiledBinding KindLabel}" FontSize="10" FontWeight="Bold" Foreground="{DynamicResource SecondaryBrush}" />
+                      </Border>
+                      <TextBlock Grid.Column="1" Text="{CompiledBinding UpdatedAtLabel}" Classes="muted" HorizontalAlignment="Right" />
+                      <Border Grid.Column="2" IsVisible="{CompiledBinding IsLarge}" Background="#22B0522F" CornerRadius="10" Padding="6,3">
+                        <TextBlock Text="{CompiledBinding FileSizeLabel}" Foreground="{DynamicResource AccentBrush}" FontSize="10" FontWeight="Bold" />
+                      </Border>
+                    </Grid>
+                    <TextBlock Grid.Row="1" Text="{CompiledBinding Title}" FontWeight="SemiBold" FontSize="15" TextTrimming="CharacterEllipsis" />
+                    <TextBlock Grid.Row="2" Text="{CompiledBinding Cwd}" Classes="muted" TextTrimming="CharacterEllipsis" />
+                  </Grid>
+                </Border>
+              </DataTemplate>
+            </ListBox.ItemTemplate>
+          </ListBox>
+        </Grid>
+      </Border>
+
+      <Border Grid.Column="1" Classes="panel">
+        <ScrollViewer>
+          <StackPanel Margin="18" Spacing="14">
+            <Grid ColumnDefinitions="*,Auto">
+              <StackPanel>
+                <TextBlock Text="{CompiledBinding SelectedTitle}" FontSize="30" FontFamily="Georgia" FontWeight="Bold" TextWrapping="Wrap" />
+                <TextBlock Text="{CompiledBinding SelectedCwd}" Classes="muted" TextWrapping="Wrap" />
+              </StackPanel>
+              <WrapPanel Grid.Column="1" HorizontalAlignment="Right">
+                <Button Classes="ghost" Content="Replay" Command="{CompiledBinding OpenTranscriptCommand}" />
+                <Button Classes="ghost"
+                        Content="Rename"
+                        Command="{CompiledBinding OpenRenameDialogCommand}"
+                        IsEnabled="{CompiledBinding CanRenameSession}"
+                        ToolTip.Tip="{CompiledBinding RenameSessionDisabledReason}" />
+                <Button Classes="ghost" Content="Sanitize" Command="{CompiledBinding OpenSanitizeDialogCommand}" />
+                <Button Classes="primary" Content="Export" Command="{CompiledBinding OpenExportDialogCommand}" />
+              </WrapPanel>
+            </Grid>
+
+            <Border Classes="card" IsVisible="{CompiledBinding HasAnalysisBanner}">
+              <TextBlock Text="{CompiledBinding AnalysisBannerText}" TextWrapping="Wrap" Foreground="{DynamicResource AccentBrush}" />
+            </Border>
+
+            <UniformGrid Columns="3" Rows="2">
+              <Border Classes="card" Margin="0,0,8,8">
+                <StackPanel>
+                  <TextBlock Classes="kicker" Text="INTERACTIONS" />
+                  <TextBlock Text="{CompiledBinding InteractionSummary}" FontWeight="SemiBold" />
+                </StackPanel>
+              </Border>
+              <Border Classes="card" Margin="0,0,8,8">
+                <StackPanel>
+                  <TextBlock Classes="kicker" Text="TOKENS" />
+                  <TextBlock Text="{CompiledBinding TokenSummaryText}" FontWeight="SemiBold" TextWrapping="Wrap" />
+                </StackPanel>
+              </Border>
+              <Border Classes="card" Margin="0,0,0,8">
+                <StackPanel>
+                  <TextBlock Classes="kicker" Text="FILE SIZE" />
+                  <TextBlock Text="{CompiledBinding SelectedFileSize}" FontWeight="SemiBold" />
+                </StackPanel>
+              </Border>
+              <Border Classes="card" Margin="0,0,8,0">
+                <StackPanel>
+                  <TextBlock Classes="kicker" Text="STARTED" />
+                  <TextBlock Text="{CompiledBinding SelectedStartedAt}" FontWeight="SemiBold" />
+                </StackPanel>
+              </Border>
+              <Border Classes="card" Margin="0,0,8,0">
+                <StackPanel>
+                  <TextBlock Classes="kicker" Text="UPDATED" />
+                  <TextBlock Text="{CompiledBinding SelectedUpdatedAt}" FontWeight="SemiBold" />
+                </StackPanel>
+              </Border>
+              <Border Classes="card">
+                <StackPanel>
+                  <TextBlock Classes="kicker" Text="SOURCE" />
+                  <TextBlock Text="{CompiledBinding SelectedSource}" FontWeight="SemiBold" />
+                </StackPanel>
+              </Border>
+            </UniformGrid>
+
+            <WrapPanel>
+              <Button Classes="ghost" Content="Analyze Anyway" Command="{CompiledBinding AnalyzeAnywayCommand}" />
+              <Button Classes="ghost" Content="Copy Token Usage" Command="{CompiledBinding CopySelectedTokenUsageCommand}" />
+              <Button Classes="ghost" Content="Open File" Command="{CompiledBinding OpenSelectedFileCommand}" />
+              <Button Classes="ghost" Content="Reveal File" Command="{CompiledBinding RevealSelectedFileCommand}" />
+            </WrapPanel>
+
+            <Border Classes="card">
+              <StackPanel Spacing="6">
+                <TextBlock Classes="kicker" Text="SESSION FILE" />
+                <SelectableTextBlock Text="{CompiledBinding SelectedFile}" FontFamily="Cascadia Code, Consolas" TextWrapping="Wrap" />
+              </StackPanel>
+            </Border>
+
+            <Border Classes="card">
+              <StackPanel Spacing="6">
+                <TextBlock Classes="kicker" Text="ENVIRONMENT" />
+                <TextBlock Text="{CompiledBinding EnvironmentSummary}" FontWeight="SemiBold" />
+                <TextBlock Text="{CompiledBinding ClaudeHomeText}" Classes="muted" TextWrapping="Wrap" />
+                <TextBlock Text="{CompiledBinding EnvironmentNotes}" Classes="muted" TextWrapping="Wrap" />
+              </StackPanel>
+            </Border>
+          </StackPanel>
+        </ScrollViewer>
+      </Border>
+    </Grid>
+
+    <Grid Grid.Row="3" ColumnDefinitions="*,Auto">
+      <TextBlock Text="{CompiledBinding StatusMessage}" Classes="muted" VerticalAlignment="Center" />
+      <ProgressBar Grid.Column="1" Width="180" IsIndeterminate="True" IsVisible="{CompiledBinding IsLoading}" />
+    </Grid>
+
+    <Border Grid.RowSpan="4" Background="#88000000" IsVisible="{CompiledBinding HasError}">
+      <Border Classes="panel" Width="560" Padding="20" HorizontalAlignment="Center" VerticalAlignment="Center">
+        <StackPanel Spacing="14">
+          <TextBlock Text="Error" FontSize="24" FontWeight="Bold" />
+          <TextBlock Text="{CompiledBinding ErrorMessage}" TextWrapping="Wrap" />
+          <Button Classes="primary" Content="Dismiss" Command="{CompiledBinding DismissDialogsCommand}" HorizontalAlignment="Right" />
+        </StackPanel>
+      </Border>
+    </Border>
+
+    <Border Grid.RowSpan="4" Background="#88000000" IsVisible="{CompiledBinding ExportDialogVisible}">
+      <Border Classes="panel" Width="720" Padding="20" HorizontalAlignment="Center" VerticalAlignment="Center">
+        <StackPanel Spacing="14">
+          <TextBlock Classes="kicker" Text="EXPORT SESSION" />
+          <TextBlock Text="{CompiledBinding SelectedTitle}" FontSize="24" FontWeight="Bold" TextWrapping="Wrap" />
+          <ComboBox ItemsSource="{CompiledBinding ExportFormats}" SelectedItem="{CompiledBinding ExportFormat, Mode=TwoWay}" />
+          <CheckBox Content="Include images" IsChecked="{CompiledBinding ExportImages, Mode=TwoWay}" />
+          <CheckBox Content="Inline images in HTML" IsChecked="{CompiledBinding ExportInlineImages, Mode=TwoWay}" />
+          <CheckBox Content="Include tool calls and tool outputs" IsChecked="{CompiledBinding ExportToolCallResults, Mode=TwoWay}" />
+          <WrapPanel HorizontalAlignment="Right">
+            <Button Classes="ghost" Content="Cancel" Command="{CompiledBinding DismissDialogsCommand}" />
+            <Button Classes="primary" Content="Start Export" Command="{CompiledBinding ConfirmExportCommand}" />
+          </WrapPanel>
+        </StackPanel>
+      </Border>
+    </Border>
+
+    <Border Grid.RowSpan="4" Background="#88000000" IsVisible="{CompiledBinding SanitizeDialogVisible}">
+      <Border Classes="panel" Width="760" Padding="20" HorizontalAlignment="Center" VerticalAlignment="Center">
+        <StackPanel Spacing="14">
+          <TextBlock Classes="kicker" Text="SANITIZED OUTPUT" />
+          <TextBlock Text="{CompiledBinding SelectedTitle}" FontSize="24" FontWeight="Bold" TextWrapping="Wrap" />
+          <TextBox PlaceholderText="Chat name" Text="{CompiledBinding SanitizeChatName, Mode=TwoWay}" />
+          <CheckBox Content="Strip image content" IsChecked="{CompiledBinding SanitizeStripImageContent, Mode=TwoWay}" IsEnabled="False" />
+          <CheckBox Content="Strip all blobs" IsChecked="{CompiledBinding SanitizeStripBlobContent, Mode=TwoWay}" />
+          <CheckBox Content="Create new JSONL copy file" IsChecked="{CompiledBinding SanitizeCreateJsonlCopy, Mode=TwoWay}" />
+          <CheckBox Content="Re-add session to current day" IsChecked="{CompiledBinding SanitizeReAddToCurrentDay, Mode=TwoWay}" IsEnabled="False" />
+          <TextBlock Classes="muted" Text="The source session is left unchanged. Output is written to a fresh temporary folder." TextWrapping="Wrap" />
+          <WrapPanel HorizontalAlignment="Right">
+            <Button Classes="ghost" Content="Cancel" Command="{CompiledBinding DismissDialogsCommand}" />
+            <Button Classes="primary" Content="Create Sanitized Output" Command="{CompiledBinding ConfirmSanitizeCommand}" />
+          </WrapPanel>
+        </StackPanel>
+      </Border>
+    </Border>
+
+    <Border Grid.RowSpan="4" Background="#88000000" IsVisible="{CompiledBinding RenameDialogVisible}">
+      <Border Classes="panel" Width="680" Padding="20" HorizontalAlignment="Center" VerticalAlignment="Center">
+        <StackPanel Spacing="14">
+          <TextBlock Classes="kicker" Text="SESSION TITLE" />
+          <TextBlock Text="Rename Session" FontSize="24" FontWeight="Bold" />
+          <TextBlock Text="Claude project-log session titles cannot be edited from clodlogs." Classes="muted" TextWrapping="Wrap" />
+          <Border Classes="card">
+            <StackPanel Spacing="6">
+              <TextBlock Classes="kicker" Text="CURRENT SESSION" />
+              <TextBlock Text="{CompiledBinding SelectedTitle}" TextWrapping="Wrap" />
+            </StackPanel>
+          </Border>
+          <TextBox PlaceholderText="Enter session title..." Text="{CompiledBinding RenameTitle, Mode=TwoWay}" />
+          <WrapPanel HorizontalAlignment="Right">
+            <Button Classes="ghost" Content="Cancel" Command="{CompiledBinding DismissDialogsCommand}" />
+            <Button Classes="primary" Content="Save Title" Command="{CompiledBinding ConfirmRenameCommand}" />
+          </WrapPanel>
+        </StackPanel>
+      </Border>
+    </Border>
+
+    <Border Grid.RowSpan="4" Background="#88000000" IsVisible="{CompiledBinding ExportProgressVisible}">
+      <Border Classes="panel" Width="640" Padding="20" HorizontalAlignment="Center" VerticalAlignment="Center">
+        <StackPanel Spacing="14">
+          <TextBlock Text="{CompiledBinding OperationTitle}" FontSize="24" FontWeight="Bold" />
+          <ProgressBar Minimum="0" Maximum="100" Value="{CompiledBinding OperationProgress}" />
+          <TextBlock Text="{CompiledBinding OperationMessage}" TextWrapping="Wrap" />
+          <TextBlock Classes="muted" Text="{CompiledBinding OperationStage}" />
+          <SelectableTextBlock Text="{CompiledBinding OperationOutputPath}" IsVisible="{CompiledBinding HasOperationOutput}" TextWrapping="Wrap" />
+          <WrapPanel HorizontalAlignment="Right">
+            <Button Classes="ghost" Content="Cancel" Command="{CompiledBinding CancelExportCommand}" />
+            <Button Classes="ghost" Content="Reveal" Command="{CompiledBinding RevealOperationOutputCommand}" />
+            <Button Classes="primary" Content="Close" Command="{CompiledBinding DismissDialogsCommand}" />
+          </WrapPanel>
+        </StackPanel>
+      </Border>
+    </Border>
+
+    <Border Grid.RowSpan="4" Background="#88000000" IsVisible="{CompiledBinding SanitizeProgressVisible}">
+      <Border Classes="panel" Width="640" Padding="20" HorizontalAlignment="Center" VerticalAlignment="Center">
+        <StackPanel Spacing="14">
+          <TextBlock Text="{CompiledBinding OperationTitle}" FontSize="24" FontWeight="Bold" />
+          <ProgressBar Minimum="0" Maximum="100" Value="{CompiledBinding OperationProgress}" />
+          <TextBlock Text="{CompiledBinding OperationMessage}" TextWrapping="Wrap" />
+          <SelectableTextBlock Text="{CompiledBinding OperationOutputPath}" IsVisible="{CompiledBinding HasOperationOutput}" TextWrapping="Wrap" />
+          <WrapPanel HorizontalAlignment="Right">
+            <Button Classes="ghost" Content="Cancel" Command="{CompiledBinding CancelSanitizeCommand}" />
+            <Button Classes="ghost" Content="Reveal" Command="{CompiledBinding RevealOperationOutputCommand}" />
+            <Button Classes="primary" Content="Close" Command="{CompiledBinding DismissDialogsCommand}" />
+          </WrapPanel>
+        </StackPanel>
+      </Border>
+    </Border>
+
+    <Border Grid.RowSpan="4" Background="#AA000000" IsVisible="{CompiledBinding TranscriptDialogVisible}">
+      <Border Classes="panel" Margin="24" Padding="18">
+        <Grid RowDefinitions="Auto,Auto,*" RowSpacing="12">
+          <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
+            <StackPanel>
+              <TextBlock Classes="kicker" Text="SESSION REPLAY" />
+              <TextBlock Text="{CompiledBinding SelectedTitle}" FontSize="26" FontWeight="Bold" TextWrapping="Wrap" />
+              <TextBlock Classes="muted" Text="{CompiledBinding TranscriptMetaText}" />
+            </StackPanel>
+            <Button Grid.Column="1" Classes="ghost" Content="Copy All" Command="{CompiledBinding CopyAllTranscriptCommand}" />
+            <Button Grid.Column="2" Classes="primary" Content="Close" Command="{CompiledBinding CloseTranscriptCommand}" />
+          </Grid>
+          <Grid Grid.Row="1" ColumnDefinitions="*,Auto" ColumnSpacing="8">
+            <TextBox PlaceholderText="Search transcript..." Text="{CompiledBinding TranscriptSearch, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+            <CheckBox Grid.Column="1" Content="Show tool calls" IsChecked="{CompiledBinding TranscriptShowToolCalls, Mode=TwoWay}" VerticalAlignment="Center" />
+          </Grid>
+          <ListBox Grid.Row="2" ItemsSource="{CompiledBinding TranscriptEntries}" Background="Transparent" BorderThickness="0">
+            <ListBox.ItemTemplate>
+              <DataTemplate x:DataType="vm:TranscriptEntryViewModel">
+                <Border Classes="card" Margin="0,0,0,10">
+                  <StackPanel Spacing="8">
+                    <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
+                      <TextBlock Text="{CompiledBinding Title}" FontWeight="Bold" />
+                      <TextBlock Grid.Column="1" Text="{CompiledBinding TimestampLabel}" Classes="muted" />
+                      <Button Grid.Column="2"
+                              Classes="ghost"
+                              Content="Copy"
+                              Command="{ReflectionBinding DataContext.CopyTranscriptEntryCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                              CommandParameter="{ReflectionBinding}" />
+                    </Grid>
+                    <SelectableTextBlock Text="{CompiledBinding Text}" FontFamily="Cascadia Code, Consolas" TextWrapping="Wrap" />
+                  </StackPanel>
+                </Border>
+              </DataTemplate>
+            </ListBox.ItemTemplate>
+          </ListBox>
+        </Grid>
+      </Border>
+    </Border>
+
+    <Border Grid.RowSpan="4" Background="#88000000" IsVisible="{CompiledBinding TokenSummaryDialogVisible}">
+      <Border Classes="panel" Width="720" Padding="20" HorizontalAlignment="Center" VerticalAlignment="Center">
+        <StackPanel Spacing="14">
+          <TextBlock Text="{CompiledBinding TokenSummaryTitle}" FontSize="24" FontWeight="Bold" />
+          <ProgressBar Minimum="0" Maximum="100" Value="{CompiledBinding TokenSummaryProgress}" />
+          <TextBlock Text="{CompiledBinding TokenSummaryMessage}" TextWrapping="Wrap" />
+          <TextBlock Text="{CompiledBinding TokenSummaryResultText}" FontSize="18" FontWeight="SemiBold" TextWrapping="Wrap" />
+          <WrapPanel HorizontalAlignment="Right">
+            <Button Classes="ghost" Content="Cancel" Command="{CompiledBinding CancelTokenSummaryCommand}" />
+            <Button Classes="ghost" Content="Copy Summary" Command="{CompiledBinding CopyTokenSummaryCommand}" />
+            <Button Classes="primary" Content="Close" Command="{CompiledBinding DismissDialogsCommand}" />
+          </WrapPanel>
+        </StackPanel>
+      </Border>
+    </Border>
+  </Grid>
+</Window>
