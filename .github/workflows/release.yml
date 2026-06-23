@@ -135,12 +135,28 @@ jobs:
       - name: Build stable Windows desktop bundle
         run: bunx electrobun build --env=stable
 
+      - name: Install WiX Toolset
+        shell: pwsh
+        run: choco install wixtoolset --no-progress --yes
+
+      - name: Build Windows MSI
+        shell: pwsh
+        run: |
+          $sourceDir = Join-Path $env:GITHUB_WORKSPACE 'build\stable-win-x64\clodlogs'
+          $outputPath = Join-Path $env:GITHUB_WORKSPACE 'artifacts\clodlogs-${{ needs.validate.outputs.version }}-windows-x64.msi'
+          $scriptPath = Join-Path $env:GITHUB_WORKSPACE 'scripts\build-windows-msi.ps1'
+
+          & $scriptPath `
+            -SourceDir $sourceDir `
+            -OutputPath $outputPath `
+            -Version '${{ needs.validate.outputs.version }}'
+
       - name: Upload desktop release artifacts
         uses: actions/upload-artifact@v7
         with:
           name: desktop-windows
           path: |
-            artifacts/stable-win-x64-clodlogs-Setup.zip
+            artifacts/clodlogs-${{ needs.validate.outputs.version }}-windows-x64.msi
             artifacts/stable-win-x64-clodlogs.tar.zst
             artifacts/stable-win-x64-update.json
           if-no-files-found: error
@@ -217,7 +233,7 @@ jobs:
           | Asset | Description |
           |-------|-------------|
           | \`clodlogs-${VERSION}.tgz\` | npm package tarball for the CLI and shared source |
-          | \`stable-win-x64-clodlogs-Setup.zip\` | Windows desktop installer bundle |
+          | \`clodlogs-${VERSION}-windows-x64.msi\` | Windows desktop installer |
           | \`stable-win-x64-clodlogs.tar.zst\` | Electrobun desktop update payload |
           | \`stable-win-x64-update.json\` | Electrobun update manifest |
           EOF
