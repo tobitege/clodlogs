@@ -43,6 +43,7 @@ Prerequisites:
 
 - Windows 10 or later
 - .NET 10 SDK for local development
+- Avalonia 12.1
 
 Run it locally:
 
@@ -62,7 +63,8 @@ Current desktop app highlights:
 
 - scans Claude project JSONL logs from `~/.claude/projects` or `%CLAUDE_HOME%\projects`
 - filters by current folder tree or repo root and can include cross-session writes
-- exports selected sessions individually or in collision-safe batches to Markdown or HTML
+- exports selected sessions to Markdown or HTML
+- batch exports filtered sessions with collision-safe file naming
 - summarizes Claude message usage for one selected session or all currently filtered sessions
 - shows environment status for Claude home access, `git`, and `rg`
 - opens a read-only full-window session replay dialog
