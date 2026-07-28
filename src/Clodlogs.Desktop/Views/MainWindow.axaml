@@ -96,37 +96,68 @@
 
     <Border Grid.Row="1" Classes="panel" Padding="14">
       <Grid RowDefinitions="Auto,Auto,Auto" RowSpacing="10">
-        <Grid ColumnDefinitions="2*,Auto,Auto,Auto" ColumnSpacing="8">
-          <TextBox PlaceholderText="Filter sessions by title, folder, or kind..." Text="{CompiledBinding SearchQuery, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-          <Button Grid.Column="1" Classes="ghost" Content="Browse Folder" Command="{CompiledBinding BrowseFolderCommand}" />
-          <Button Grid.Column="2" Classes="ghost" Content="All Sessions" Command="{CompiledBinding ShowAllSessionsCommand}" />
-          <Button Grid.Column="3" Classes="primary" Content="Refresh" Command="{CompiledBinding RefreshCommand}" />
+        <Grid ColumnDefinitions="*,*,Auto,Auto,Auto" ColumnSpacing="8">
+          <TextBox PlaceholderText="Folder path" Text="{CompiledBinding FolderPath, Mode=TwoWay}" />
+          <TextBox Grid.Column="1" PlaceholderText="Claude home override" Text="{CompiledBinding ClaudeHome, Mode=TwoWay}" />
+          <Button Grid.Column="2" Classes="ghost" Content="Browse Folder" Command="{CompiledBinding BrowseFolderCommand}" />
+          <Button Grid.Column="3" Classes="ghost" Content="All Sessions" Command="{CompiledBinding ShowAllSessionsCommand}" />
+          <Button Grid.Column="4" Classes="primary" Content="Refresh" Command="{CompiledBinding RefreshCommand}" />
         </Grid>
-        <Grid Grid.Row="1" ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
-          <TextBox PlaceholderText="Claude home override" Text="{CompiledBinding ClaudeHome, Mode=TwoWay}" />
-          <TextBox Grid.Column="1" Width="220" PlaceholderText="Folder path" Text="{CompiledBinding FolderPath, Mode=TwoWay}" />
-          <Button Grid.Column="2" Classes="ghost" Content="Token Summary" Command="{CompiledBinding OpenTokenSummaryCommand}" />
-        </Grid>
-        <WrapPanel Grid.Row="2">
-          <CheckBox Content="CWD only" IsChecked="{CompiledBinding CwdOnly, Mode=TwoWay}" />
-          <CheckBox Content="Include cross-session writes" IsChecked="{CompiledBinding IncludeCrossSessionWrites, Mode=TwoWay}" />
-          <CheckBox Content="Live" IsChecked="{CompiledBinding ShowLiveSessions, Mode=TwoWay}" />
-          <CheckBox Content="Archived" IsChecked="{CompiledBinding ShowArchivedSessions, Mode=TwoWay}" />
-          <TextBlock Classes="muted" Text="From" VerticalAlignment="Center" />
-          <TextBox Width="130" PlaceholderText="yyyy-mm-dd" Text="{CompiledBinding DateFrom, Mode=TwoWay}" />
-          <TextBlock Classes="muted" Text="To" VerticalAlignment="Center" />
-          <TextBox Width="130" PlaceholderText="yyyy-mm-dd" Text="{CompiledBinding DateTo, Mode=TwoWay}" />
+        <WrapPanel Grid.Row="1" VerticalAlignment="Center">
+          <TextBox Width="200"
+                   Margin="0,0,14,0"
+                   PlaceholderText="Filter sessions..."
+                   Text="{CompiledBinding SearchQuery, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+          <CheckBox Margin="0,0,14,0" Content="CWD only" IsChecked="{CompiledBinding CwdOnly, Mode=TwoWay}" />
+          <CheckBox Margin="0,0,14,0" Content="Include cross-session writes" IsChecked="{CompiledBinding IncludeCrossSessionWrites, Mode=TwoWay}" />
+          <CheckBox Margin="0,0,14,0" Content="Live" IsChecked="{CompiledBinding ShowLiveSessions, Mode=TwoWay}" />
+          <CheckBox Margin="0,0,14,0" Content="Archived" IsChecked="{CompiledBinding ShowArchivedSessions, Mode=TwoWay}" />
+          <TextBlock Margin="0,0,6,0" Classes="muted" Text="From" VerticalAlignment="Center" />
+          <TextBox Width="110" Margin="0,0,10,0" PlaceholderText="yyyy-mm-dd" Text="{CompiledBinding DateFrom, Mode=TwoWay}" />
+          <TextBlock Margin="0,0,6,0" Classes="muted" Text="To" VerticalAlignment="Center" />
+          <TextBox Width="110" PlaceholderText="yyyy-mm-dd" Text="{CompiledBinding DateTo, Mode=TwoWay}" />
         </WrapPanel>
+        <Border Grid.Row="2"
+                Background="#18B0522F"
+                BorderBrush="#55B0522F"
+                BorderThickness="1"
+                CornerRadius="8"
+                Padding="10,8"
+                IsVisible="{CompiledBinding HasPartialSessionResults}">
+          <TextBlock Text="{CompiledBinding PartialSessionResultsMessage}"
+                     Foreground="{DynamicResource AccentBrush}"
+                     FontWeight="SemiBold"
+                     TextWrapping="Wrap" />
+        </Border>
       </Grid>
     </Border>
 
     <Grid Grid.Row="2" ColumnDefinitions="390,*" ColumnSpacing="14">
       <Border Classes="panel">
         <Grid RowDefinitions="Auto,*">
-          <StackPanel Margin="14" Spacing="5">
-            <TextBlock Text="Sessions" FontSize="22" FontFamily="Georgia" FontWeight="Bold" />
-            <TextBlock Classes="muted" Text="{CompiledBinding ArchivedCountText}" />
-          </StackPanel>
+          <Grid Margin="14" ColumnDefinitions="Auto,*" ColumnSpacing="10">
+            <Button Width="28"
+                    Height="28"
+                    Padding="0"
+                    Classes="ghost"
+                    Content="&#x2630;"
+                    FontSize="17"
+                    HorizontalContentAlignment="Center"
+                    VerticalContentAlignment="Center"
+                    VerticalAlignment="Top"
+                    ToolTip.Tip="Session actions">
+              <Button.Flyout>
+                <MenuFlyout>
+                  <MenuItem Header="Batch Export" Command="{CompiledBinding OpenBatchExportDialogCommand}" />
+                  <MenuItem Header="Token Summary" Command="{CompiledBinding OpenTokenSummaryCommand}" />
+                </MenuFlyout>
+              </Button.Flyout>
+            </Button>
+            <StackPanel Grid.Column="1" Spacing="5">
+              <TextBlock Text="Sessions" FontSize="22" FontFamily="Georgia" FontWeight="Bold" />
+              <TextBlock Classes="muted" Text="{CompiledBinding ArchivedCountText}" />
+            </StackPanel>
+          </Grid>
           <ListBox Grid.Row="1"
                    Classes="session-list"
                    ItemsSource="{CompiledBinding FilteredSessions}"
@@ -170,11 +201,6 @@
               </StackPanel>
               <WrapPanel Grid.Column="1" HorizontalAlignment="Right">
                 <Button Classes="ghost" Content="Replay" Command="{CompiledBinding OpenTranscriptCommand}" />
-                <Button Classes="ghost"
-                        Content="Rename"
-                        Command="{CompiledBinding OpenRenameDialogCommand}"
-                        IsEnabled="{CompiledBinding CanRenameSession}"
-                        ToolTip.Tip="{CompiledBinding RenameSessionDisabledReason}" />
                 <Button Classes="ghost" Content="Sanitize" Command="{CompiledBinding OpenSanitizeDialogCommand}" />
                 <Button Classes="primary" Content="Export" Command="{CompiledBinding OpenExportDialogCommand}" />
               </WrapPanel>
@@ -275,10 +301,77 @@
           <CheckBox Content="Inline images in HTML" IsChecked="{CompiledBinding ExportInlineImages, Mode=TwoWay}" />
           <CheckBox Content="Include tool calls and tool outputs" IsChecked="{CompiledBinding ExportToolCallResults, Mode=TwoWay}" />
           <WrapPanel HorizontalAlignment="Right">
-            <Button Classes="ghost" Content="Cancel" Command="{CompiledBinding DismissDialogsCommand}" />
             <Button Classes="primary" Content="Start Export" Command="{CompiledBinding ConfirmExportCommand}" />
+            <Button Classes="ghost" Content="Cancel" Command="{CompiledBinding DismissDialogsCommand}" />
           </WrapPanel>
         </StackPanel>
+      </Border>
+    </Border>
+
+    <Border Grid.RowSpan="4" Background="#AA000000" IsVisible="{CompiledBinding BatchExportDialogVisible}">
+      <Border Classes="panel" Margin="40" Padding="20" MaxWidth="1180" HorizontalAlignment="Stretch" VerticalAlignment="Stretch">
+        <Grid RowDefinitions="Auto,*,Auto" RowSpacing="14">
+          <StackPanel Spacing="12">
+            <StackPanel Spacing="4">
+              <TextBlock Classes="kicker" Text="BATCH EXPORT" />
+              <TextBlock Text="Export visible sessions" FontSize="28" FontWeight="Bold" />
+              <TextBlock Classes="muted" Text="Choose the sessions and destination folder. Each file uses the session name and its UTC start timestamp." TextWrapping="Wrap" />
+            </StackPanel>
+            <Grid ColumnDefinitions="Auto,Auto,150,*,Auto" ColumnSpacing="8">
+              <Button Classes="ghost" Content="Select All" Command="{CompiledBinding SelectAllBatchExportCommand}" />
+              <Button Grid.Column="1" Classes="ghost" Content="Clear All" Command="{CompiledBinding ClearBatchExportCommand}" />
+              <ComboBox Grid.Column="2" ItemsSource="{CompiledBinding ExportFormats}" SelectedItem="{CompiledBinding ExportFormat, Mode=TwoWay}" />
+              <TextBox Grid.Column="3"
+                       PlaceholderText="Target folder"
+                       Text="{CompiledBinding BatchExportDirectory, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+              <Button Grid.Column="4" Classes="ghost" Content="Browse..." Command="{CompiledBinding BrowseBatchExportDirectoryCommand}" />
+            </Grid>
+            <WrapPanel>
+              <CheckBox Content="Include images" IsChecked="{CompiledBinding ExportImages, Mode=TwoWay}" />
+              <CheckBox Content="Inline images in HTML" IsChecked="{CompiledBinding ExportInlineImages, Mode=TwoWay}" />
+              <CheckBox Content="Include tool calls and tool outputs" IsChecked="{CompiledBinding ExportToolCallResults, Mode=TwoWay}" />
+            </WrapPanel>
+          </StackPanel>
+
+          <Border Grid.Row="1" Classes="card" Padding="0">
+            <Grid RowDefinitions="Auto,*">
+              <Grid ColumnDefinitions="52,2*,180,3*" ColumnSpacing="10" Margin="12,10">
+                <TextBlock Classes="kicker" Text="USE" HorizontalAlignment="Center" />
+                <TextBlock Grid.Column="1" Classes="kicker" Text="SESSION" />
+                <TextBlock Grid.Column="2" Classes="kicker" Text="STARTED" />
+                <TextBlock Grid.Column="3" Classes="kicker" Text="PROPOSED OUTPUT" />
+              </Grid>
+              <ListBox Grid.Row="1"
+                       Classes="session-list"
+                       ItemsSource="{CompiledBinding BatchExportSessions}"
+                       Padding="8">
+                <ListBox.ItemsPanel>
+                  <ItemsPanelTemplate>
+                    <VirtualizingStackPanel />
+                  </ItemsPanelTemplate>
+                </ListBox.ItemsPanel>
+                <ListBox.ItemTemplate>
+                  <DataTemplate x:DataType="vm:BatchExportSessionViewModel">
+                    <Border Classes="card" Padding="10">
+                      <Grid ColumnDefinitions="42,2*,180,3*" ColumnSpacing="10">
+                        <CheckBox IsChecked="{CompiledBinding IsSelected, Mode=TwoWay}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        <TextBlock Grid.Column="1" Text="{CompiledBinding Title}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                        <TextBlock Grid.Column="2" Text="{CompiledBinding StartedAtLabel}" Classes="muted" VerticalAlignment="Center" />
+                        <TextBlock Grid.Column="3" Text="{CompiledBinding OutputFileName}" Classes="muted" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                      </Grid>
+                    </Border>
+                  </DataTemplate>
+                </ListBox.ItemTemplate>
+              </ListBox>
+            </Grid>
+          </Border>
+
+          <Grid Grid.Row="2" ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
+            <TextBlock Text="{CompiledBinding BatchExportSelectionText}" Classes="muted" VerticalAlignment="Center" />
+            <Button Grid.Column="1" Classes="primary" Content="Export" Command="{CompiledBinding ConfirmBatchExportCommand}" />
+            <Button Grid.Column="2" Classes="ghost" Content="Cancel" Command="{CompiledBinding DismissDialogsCommand}" />
+          </Grid>
+        </Grid>
       </Border>
     </Border>
 
@@ -294,29 +387,8 @@
           <CheckBox Content="Re-add session to current day" IsChecked="{CompiledBinding SanitizeReAddToCurrentDay, Mode=TwoWay}" IsEnabled="False" />
           <TextBlock Classes="muted" Text="The source session is left unchanged. Output is written to a fresh temporary folder." TextWrapping="Wrap" />
           <WrapPanel HorizontalAlignment="Right">
-            <Button Classes="ghost" Content="Cancel" Command="{CompiledBinding DismissDialogsCommand}" />
             <Button Classes="primary" Content="Create Sanitized Output" Command="{CompiledBinding ConfirmSanitizeCommand}" />
-          </WrapPanel>
-        </StackPanel>
-      </Border>
-    </Border>
-
-    <Border Grid.RowSpan="4" Background="#88000000" IsVisible="{CompiledBinding RenameDialogVisible}">
-      <Border Classes="panel" Width="680" Padding="20" HorizontalAlignment="Center" VerticalAlignment="Center">
-        <StackPanel Spacing="14">
-          <TextBlock Classes="kicker" Text="SESSION TITLE" />
-          <TextBlock Text="Rename Session" FontSize="24" FontWeight="Bold" />
-          <TextBlock Text="Claude project-log session titles cannot be edited from clodlogs." Classes="muted" TextWrapping="Wrap" />
-          <Border Classes="card">
-            <StackPanel Spacing="6">
-              <TextBlock Classes="kicker" Text="CURRENT SESSION" />
-              <TextBlock Text="{CompiledBinding SelectedTitle}" TextWrapping="Wrap" />
-            </StackPanel>
-          </Border>
-          <TextBox PlaceholderText="Enter session title..." Text="{CompiledBinding RenameTitle, Mode=TwoWay}" />
-          <WrapPanel HorizontalAlignment="Right">
             <Button Classes="ghost" Content="Cancel" Command="{CompiledBinding DismissDialogsCommand}" />
-            <Button Classes="primary" Content="Save Title" Command="{CompiledBinding ConfirmRenameCommand}" />
           </WrapPanel>
         </StackPanel>
       </Border>
@@ -327,13 +399,15 @@
         <StackPanel Spacing="14">
           <TextBlock Text="{CompiledBinding OperationTitle}" FontSize="24" FontWeight="Bold" />
           <ProgressBar Minimum="0" Maximum="100" Value="{CompiledBinding OperationProgress}" />
-          <TextBlock Text="{CompiledBinding OperationMessage}" TextWrapping="Wrap" />
+          <Grid Height="46" ClipToBounds="True">
+            <TextBlock Text="{CompiledBinding OperationMessage}" TextWrapping="Wrap" MaxLines="2" TextTrimming="CharacterEllipsis" />
+          </Grid>
           <TextBlock Classes="muted" Text="{CompiledBinding OperationStage}" />
           <SelectableTextBlock Text="{CompiledBinding OperationOutputPath}" IsVisible="{CompiledBinding HasOperationOutput}" TextWrapping="Wrap" />
           <WrapPanel HorizontalAlignment="Right">
-            <Button Classes="ghost" Content="Cancel" Command="{CompiledBinding CancelExportCommand}" />
-            <Button Classes="ghost" Content="Reveal" Command="{CompiledBinding RevealOperationOutputCommand}" />
-            <Button Classes="primary" Content="Close" Command="{CompiledBinding DismissDialogsCommand}" />
+            <Button Classes="ghost" Content="Reveal" Command="{CompiledBinding RevealOperationOutputCommand}" IsVisible="{CompiledBinding HasOperationOutput}" />
+            <Button Classes="primary" Content="Close" Command="{CompiledBinding DismissDialogsCommand}" IsVisible="{CompiledBinding CanCloseOperationProgress}" />
+            <Button Classes="ghost" Content="Cancel" Command="{CompiledBinding CancelOperationCommand}" IsVisible="{CompiledBinding IsOperationRunning}" />
           </WrapPanel>
         </StackPanel>
       </Border>
@@ -344,12 +418,14 @@
         <StackPanel Spacing="14">
           <TextBlock Text="{CompiledBinding OperationTitle}" FontSize="24" FontWeight="Bold" />
           <ProgressBar Minimum="0" Maximum="100" Value="{CompiledBinding OperationProgress}" />
-          <TextBlock Text="{CompiledBinding OperationMessage}" TextWrapping="Wrap" />
+          <Grid Height="46" ClipToBounds="True">
+            <TextBlock Text="{CompiledBinding OperationMessage}" TextWrapping="Wrap" MaxLines="2" TextTrimming="CharacterEllipsis" />
+          </Grid>
           <SelectableTextBlock Text="{CompiledBinding OperationOutputPath}" IsVisible="{CompiledBinding HasOperationOutput}" TextWrapping="Wrap" />
           <WrapPanel HorizontalAlignment="Right">
-            <Button Classes="ghost" Content="Cancel" Command="{CompiledBinding CancelSanitizeCommand}" />
-            <Button Classes="ghost" Content="Reveal" Command="{CompiledBinding RevealOperationOutputCommand}" />
-            <Button Classes="primary" Content="Close" Command="{CompiledBinding DismissDialogsCommand}" />
+            <Button Classes="ghost" Content="Reveal" Command="{CompiledBinding RevealOperationOutputCommand}" IsVisible="{CompiledBinding HasOperationOutput}" />
+            <Button Classes="primary" Content="Close" Command="{CompiledBinding DismissDialogsCommand}" IsVisible="{CompiledBinding CanCloseOperationProgress}" />
+            <Button Classes="ghost" Content="Cancel" Command="{CompiledBinding CancelOperationCommand}" IsVisible="{CompiledBinding IsOperationRunning}" />
           </WrapPanel>
         </StackPanel>
       </Border>
@@ -403,10 +479,35 @@
           <TextBlock Text="{CompiledBinding TokenSummaryMessage}" TextWrapping="Wrap" />
           <TextBlock Text="{CompiledBinding TokenSummaryResultText}" FontSize="18" FontWeight="SemiBold" TextWrapping="Wrap" />
           <WrapPanel HorizontalAlignment="Right">
-            <Button Classes="ghost" Content="Cancel" Command="{CompiledBinding CancelTokenSummaryCommand}" />
             <Button Classes="ghost" Content="Copy Summary" Command="{CompiledBinding CopyTokenSummaryCommand}" />
-            <Button Classes="primary" Content="Close" Command="{CompiledBinding DismissDialogsCommand}" />
+            <Button Classes="primary" Content="Close" Command="{CompiledBinding DismissDialogsCommand}" IsVisible="{CompiledBinding CanCloseTokenSummary}" />
+            <Button Classes="ghost" Content="Cancel" Command="{CompiledBinding CancelTokenSummaryCommand}" IsVisible="{CompiledBinding IsTokenSummaryRunning}" />
           </WrapPanel>
+        </StackPanel>
+      </Border>
+    </Border>
+
+    <Border Grid.RowSpan="4"
+            Margin="-20"
+            Padding="20"
+            Background="{DynamicResource AppBackgroundBrush}"
+            IsVisible="{CompiledBinding StartupLoadingVisible}">
+      <Border Classes="panel" Width="620" Padding="28" HorizontalAlignment="Center" VerticalAlignment="Center">
+        <StackPanel Spacing="16">
+          <TextBlock Text="clodlogs" FontSize="46" FontFamily="Georgia" FontWeight="Bold" />
+          <StackPanel Spacing="5">
+            <TextBlock Classes="kicker" Text="STARTING" />
+            <TextBlock Text="Loading sessions..." FontSize="28" FontWeight="Bold" />
+            <TextBlock Text="{CompiledBinding StartupLoadingMessage}" Classes="muted" TextWrapping="Wrap" />
+          </StackPanel>
+          <ProgressBar Height="8" IsIndeterminate="True" />
+          <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
+            <TextBlock Classes="muted"
+                       Text="Session folders with large or numerous JSONL files may need 30 seconds or more to scan."
+                       TextWrapping="Wrap"
+                       VerticalAlignment="Center" />
+            <Button Grid.Column="1" Classes="ghost" Content="Stop Scan" Command="{CompiledBinding StopStartupScanCommand}" />
+          </Grid>
         </StackPanel>
       </Border>
     </Border>

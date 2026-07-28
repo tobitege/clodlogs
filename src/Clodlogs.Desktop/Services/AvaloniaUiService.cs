@@ -27,7 +27,13 @@ public sealed class AvaloniaUiService(Window window, AppSettingsService settings
     public async Task<string?> PickExportDirectoryAsync(string sessionFilePath)
     {
         var appSettings = await settings.ReadAsync();
-        var startPath = appSettings.ExportDirectory ?? Path.GetDirectoryName(sessionFilePath);
+        return await PickExportDirectoryFromAsync(appSettings.ExportDirectory ?? Path.GetDirectoryName(sessionFilePath));
+    }
+
+    public async Task<string?> PickExportDirectoryFromAsync(string? startingFolder)
+    {
+        var appSettings = await settings.ReadAsync();
+        var startPath = startingFolder ?? appSettings.ExportDirectory;
         var start = await TryGetFolderAsync(GetStartingFolder(startPath));
         var folders = await window.StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
         {
@@ -117,14 +123,28 @@ public sealed class AvaloniaUiService(Window window, AppSettingsService settings
         {
             if (OperatingSystem.IsWindows())
             {
-                var argument = File.Exists(path) ? $"/select,\"{path}\"" : $"\"{path}\"";
-                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                if (Directory.Exists(path))
+                {
+                    var directoryProcess = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                    {
+                        FileName = "explorer.exe",
+                        Arguments = $"\"{Path.GetFullPath(path)}\"",
+                        UseShellExecute = true
+                    });
+                    return Task.FromResult(directoryProcess is not null);
+                }
+                if (!File.Exists(path))
+                {
+                    return Task.FromResult(false);
+                }
+
+                var fileProcess = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
                 {
                     FileName = "explorer.exe",
-                    Arguments = argument,
+                    Arguments = $"/select,\"{Path.GetFullPath(path)}\"",
                     UseShellExecute = true
                 });
-                return Task.FromResult(true);
+                return Task.FromResult(fileProcess is not null);
             }
 
             var directory = Directory.Exists(path) ? path : Path.GetDirectoryName(path);

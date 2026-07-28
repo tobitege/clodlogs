@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Diagnostics;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Encodings.Web;
@@ -16,6 +17,7 @@ public sealed class ClaudeSessionService
     public const int MaxJsonlLineBytesHard = 32 * 1024 * 1024;
     public const int ExportMaxJsonlLineBytes = 128 * 1024 * 1024;
     private const int BlobTextThresholdBytes = 4096;
+    private static readonly TimeSpan BatchExportJobRetention = TimeSpan.FromMinutes(5);
     private static readonly JsonSerializerOptions CompactJsonOptions = new()
     {
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
@@ -27,6 +29,7 @@ public sealed class ClaudeSessionService
     };
 
     private readonly Dictionary<string, JobRecord<ExportJobStatus>> _exportJobs = new();
+    private readonly Dictionary<string, JobRecord<BatchExportJobStatus>> _batchExportJobs = new();
     private readonly Dictionary<string, JobRecord<ExportJobStatus>> _sanitizedJobs = new();
     private readonly Dictionary<string, JobRecord<TokenUsageSummaryJobStatus>> _tokenSummaryJobs = new();
     private readonly object _gate = new();
@@ -43,6 +46,7 @@ public sealed class ClaudeSessionService
         string? dateTo,
         bool includeCrossSessionWrites,
         string? currentWorkingDirectory = null,
+        IProgress<SessionScanProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
         var currentDirectory = Path.GetFullPath(currentWorkingDirectory ?? Environment.CurrentDirectory);
@@ -64,50 +68,122 @@ public sealed class ClaudeSessionService
         }
 
         var projectsDirectory = Path.Combine(resolvedClaudeHome, "projects");
-        var files = Directory.Exists(projectsDirectory)
-            ? Directory.EnumerateFiles(projectsDirectory, "*.jsonl", SearchOption.AllDirectories).ToList()
-            : [];
-        var dateRange = DateRange.Create(dateFrom, dateTo);
-        HashSet<string>? candidateFiles = null;
-        if (targetRootAliases is not null)
+        var files = new List<string>();
+        var isComplete = true;
+        if (Directory.Exists(projectsDirectory))
         {
-            candidateFiles = await FindCandidateSessionFilesAsync(files, targetRootAliases, cancellationToken);
-        }
-
-        var matches = new List<SessionMetaMatch>();
-        foreach (var file in files)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (candidateFiles is not null && !candidateFiles.Contains(NormalizeFileLookupPath(file)))
+            try
             {
-                continue;
-            }
-
-            var probe = await ProbeSessionFileAsync(file, cancellationToken);
-            if (probe is null || !dateRange.Matches(probe.StartedAt, probe.UpdatedAt))
-            {
-                continue;
-            }
-
-            if (targetRootAliases is not null)
-            {
-                var cwdMatches = MatchesRootAliases(probe.Cwd, targetRootAliases);
-                if (!cwdMatches && (!includeCrossSessionWrites || !await SessionTouchesRootAsync(file, targetRootAliases, probe.Cwd, cancellationToken)))
+                var options = new EnumerationOptions
                 {
-                    continue;
+                    RecurseSubdirectories = true,
+                    IgnoreInaccessible = true
+                };
+                foreach (var file in Directory.EnumerateFiles(projectsDirectory, "*.jsonl", options))
+                {
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        isComplete = false;
+                        break;
+                    }
+
+                    files.Add(file);
                 }
             }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                isComplete = false;
+            }
+        }
 
-            matches.Add(new SessionMetaMatch(
-                SessionKind.Live,
-                probe.Id,
-                file,
-                probe.FileSizeBytes,
-                probe.Cwd,
-                probe.StartedAt,
-                probe.UpdatedAt,
-                probe.ThreadName,
-                probe.Source));
+        if (cancellationToken.IsCancellationRequested)
+        {
+            isComplete = false;
+        }
+
+        var dateRange = DateRange.Create(dateFrom, dateTo);
+        var matches = new List<SessionMetaMatch>();
+        var scannedFileCount = 0;
+        progress?.Report(new SessionScanProgress(0, files.Count, null));
+        foreach (var file in files)
+        {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                isComplete = false;
+                break;
+            }
+
+            SessionMetaMatch? match = null;
+            var fileCompleted = false;
+            try
+            {
+                var probe = await ProbeSessionFileAsync(file, cancellationToken);
+                if (probe is not null && dateRange.Matches(probe.StartedAt, probe.UpdatedAt))
+                {
+                    var inScope = true;
+                    if (targetRootAliases is not null)
+                    {
+                        var cwdMatches = MatchesRootAliases(probe.Cwd, targetRootAliases);
+                        if (!cwdMatches && includeCrossSessionWrites)
+                        {
+                            try
+                            {
+                                inScope = await SessionTouchesRootAsync(file, targetRootAliases, probe.Cwd, cancellationToken);
+                            }
+                            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                            {
+                                throw;
+                            }
+                            catch
+                            {
+                                cancellationToken.ThrowIfCancellationRequested();
+                                inScope = false;
+                            }
+                        }
+                        else
+                        {
+                            inScope = cwdMatches;
+                        }
+                    }
+
+                    if (inScope)
+                    {
+                        match = new SessionMetaMatch(
+                            SessionKind.Live,
+                            probe.Id,
+                            file,
+                            probe.FileSizeBytes,
+                            probe.Cwd,
+                            probe.StartedAt,
+                            probe.UpdatedAt,
+                            probe.ThreadName,
+                            probe.Source);
+                    }
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+                if (match is not null)
+                {
+                    matches.Add(match);
+                }
+                fileCompleted = true;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                isComplete = false;
+                break;
+            }
+            finally
+            {
+                if (fileCompleted)
+                {
+                    scannedFileCount++;
+                    if (match is not null || scannedFileCount == files.Count || scannedFileCount % 25 == 0)
+                    {
+                        progress?.Report(new SessionScanProgress(scannedFileCount, files.Count, match));
+                    }
+                }
+            }
         }
 
         matches.Sort((left, right) => CompareByNewestDesc(left, right));
@@ -121,7 +197,10 @@ public sealed class ClaudeSessionService
             matches.Count,
             liveCount,
             matches.Count - liveCount,
-            matches);
+            matches,
+            scannedFileCount,
+            files.Count,
+            isComplete);
     }
 
     public async Task<SessionDetailMetrics> GetSessionDetailMetricsAsync(
@@ -367,7 +446,7 @@ public sealed class ClaudeSessionService
             try
             {
                 var path = format == "markdown"
-                    ? await ExportSessionJsonlToMarkdownAsync(sessionFilePath, includeImages, includeToolCallResults, outputDirectory, progress => SetExportStatus(jobId, progress), record.Cancellation.Token)
+                    ? await ExportSessionJsonlToMarkdownAsync(sessionFilePath, includeImages, includeToolCallResults, outputDirectory, outputPath, progress => SetExportStatus(jobId, progress), record.Cancellation.Token)
                     : await ExportSessionJsonlToHtmlAsync(sessionFilePath, includeImages, inlineImages, includeToolCallResults, outputDirectory, outputPath, progress => SetExportStatus(jobId, progress), record.Cancellation.Token);
                 SetExportStatus(jobId, new ExportJobStatus("success", 100, "done", $"{ToTitleCase(format)} written to {path}", path));
             }
@@ -380,6 +459,130 @@ public sealed class ClaudeSessionService
             {
                 var current = GetExportJobStatus(jobId);
                 SetExportStatus(jobId, current with { Kind = "error", Stage = "error", Message = ex.Message, OutputPath = null });
+            }
+        });
+
+        return new JobStartResult(jobId);
+    }
+
+    public JobStartResult StartBatchExportJob(
+        string format,
+        IReadOnlyList<BatchExportSessionRequest> sessions,
+        bool includeImages,
+        bool inlineImages,
+        bool includeToolCallResults,
+        string outputDirectory)
+    {
+        if (format is not ("markdown" or "html"))
+        {
+            throw new ArgumentException("Batch export format must be markdown or html.", nameof(format));
+        }
+
+        var batch = sessions.ToArray();
+        var jobId = Guid.NewGuid().ToString("N");
+        var record = new JobRecord<BatchExportJobStatus>(
+            new CancellationTokenSource(),
+            new BatchExportJobStatus("working", 1, "starting", $"Preparing {batch.Length} session{(batch.Length == 1 ? "" : "s")}...", null, null));
+        lock (_gate)
+        {
+            _batchExportJobs[jobId] = record;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            var succeeded = 0;
+            var failures = new List<BatchExportFailure>();
+            string? resolvedOutputDirectory = null;
+            try
+            {
+                if (batch.Length == 0)
+                {
+                    throw new InvalidOperationException("Select at least one session to export.");
+                }
+
+                resolvedOutputDirectory = ResolveFilesystemPath(outputDirectory);
+                Directory.CreateDirectory(resolvedOutputDirectory);
+                var needsExternalAssets = includeImages && (format == "markdown" || !inlineImages);
+
+                for (var index = 0; index < batch.Length; index++)
+                {
+                    record.Cancellation.Token.ThrowIfCancellationRequested();
+                    var session = batch[index];
+                    var proposedName = BuildBatchExportFileName(session.SessionName, session.StartedAt, format);
+                    var outputPath = CreateAvailableBatchExportPath(resolvedOutputDirectory, proposedName, needsExternalAssets, record.Cancellation.Token);
+                    var displayName = Path.GetFileName(outputPath);
+                    SetBatchExportStatus(jobId, new BatchExportJobStatus(
+                        "working",
+                        Math.Max(1, (int)Math.Round(index / (double)batch.Length * 100)),
+                        "exporting",
+                        $"Exporting {index + 1} of {batch.Length}: {displayName}",
+                        resolvedOutputDirectory,
+                        null));
+
+                    try
+                    {
+                        void Report(ExportJobStatus status)
+                        {
+                            var progress = Math.Clamp((int)Math.Round((index + status.ProgressPercent / 100d) / batch.Length * 100), 1, 99);
+                            SetBatchExportStatus(jobId, new BatchExportJobStatus(
+                                "working",
+                                progress,
+                                status.Stage,
+                                $"Exporting {index + 1} of {batch.Length}: {displayName}",
+                                resolvedOutputDirectory,
+                                null));
+                        }
+
+                        if (format == "markdown")
+                        {
+                            await ExportSessionJsonlToMarkdownAsync(session.SessionFilePath, includeImages, includeToolCallResults, null, outputPath, Report, record.Cancellation.Token);
+                        }
+                        else
+                        {
+                            await ExportSessionJsonlToHtmlAsync(session.SessionFilePath, includeImages, inlineImages, includeToolCallResults, null, outputPath, Report, record.Cancellation.Token);
+                        }
+                        succeeded++;
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // The zero-byte reservation may predate export setup and must always be released.
+                        TryDeleteFile(outputPath);
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        TryDeleteFile(outputPath);
+                        failures.Add(new BatchExportFailure(session.SessionFilePath, ex.Message));
+                    }
+                }
+
+                var result = new BatchExportResult(failures.ToArray());
+                var kind = failures.Count == 0 ? "success" : succeeded == 0 ? "error" : "partial";
+                var message = failures.Count == 0
+                    ? $"Exported {succeeded} session{(succeeded == 1 ? "" : "s")}."
+                    : $"Exported {succeeded} of {batch.Length} sessions; {failures.Count} failed.";
+                SetBatchExportStatus(jobId, new BatchExportJobStatus(kind, 100, "done", message, resolvedOutputDirectory, result));
+            }
+            catch (OperationCanceledException)
+            {
+                var completed = succeeded + failures.Count;
+                var result = new BatchExportResult(failures.ToArray());
+                SetBatchExportStatus(jobId, new BatchExportJobStatus(
+                    "cancelled",
+                    GetBatchExportJobStatus(jobId).ProgressPercent,
+                    "cancelled",
+                    $"Batch export cancelled after {completed} of {batch.Length} sessions.",
+                    resolvedOutputDirectory,
+                    result));
+            }
+            catch (Exception ex)
+            {
+                var result = new BatchExportResult(failures.ToArray());
+                SetBatchExportStatus(jobId, new BatchExportJobStatus("error", 0, "error", ex.Message, resolvedOutputDirectory, result));
+            }
+            finally
+            {
+                ScheduleBatchExportJobCleanup(jobId, record);
             }
         });
 
@@ -407,6 +610,31 @@ public sealed class ClaudeSessionService
 
             record.Cancellation.Cancel();
             record.Status = record.Status with { Message = "Cancelling export..." };
+            return true;
+        }
+    }
+
+    public BatchExportJobStatus GetBatchExportJobStatus(string jobId)
+    {
+        lock (_gate)
+        {
+            return _batchExportJobs.TryGetValue(jobId, out var record)
+                ? record.Status
+                : new BatchExportJobStatus("error", 0, "missing", "The batch export job is no longer available.", null, null);
+        }
+    }
+
+    public bool CancelBatchExportJob(string jobId)
+    {
+        lock (_gate)
+        {
+            if (!_batchExportJobs.TryGetValue(jobId, out var record) || record.Status.Kind != "working")
+            {
+                return false;
+            }
+
+            record.Cancellation.Cancel();
+            record.Status = record.Status with { Message = "Cancelling batch export..." };
             return true;
         }
     }
@@ -623,12 +851,6 @@ public sealed class ClaudeSessionService
         }
     }
 
-    public async Task RenameSessionThreadNameAsync(string? claudeHome, string threadId, string threadName)
-    {
-        await Task.CompletedTask;
-        throw new NotSupportedException("Renaming Claude project-log sessions is not supported.");
-    }
-
     public string FormatTokenUsageForClipboard(string sessionTitle, SessionTokenUsage usage)
         => string.Join(Environment.NewLine, [
             $"Session: {sessionTitle}",
@@ -718,28 +940,41 @@ public sealed class ClaudeSessionService
         return collapsed.Length <= 160 ? collapsed : collapsed[..160].Trim();
     }
 
+    public static string BuildBatchExportFileName(string? sessionName, string? startedAt, string format)
+    {
+        var safeName = SanitizeBatchExportFileStem(sessionName);
+        var timestamp = DateTimeOffset.TryParse(startedAt, CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces, out var parsed)
+            ? parsed.ToUniversalTime().ToString("yyyy-MM-dd'T'HH-mm-ss.fff'Z'", CultureInfo.InvariantCulture)
+            : "unknown-start";
+        var extension = format == "html" ? ".html" : ".md";
+        return $"{safeName} - {timestamp}{extension}";
+    }
+
     private async Task<string> ExportSessionJsonlToMarkdownAsync(
         string inputPath,
         bool includeImages,
         bool includeToolCallResults,
         string? outputDirectory,
+        string? outputPath,
         Action<ExportJobStatus> progress,
         CancellationToken cancellationToken)
     {
         var sessionFilePath = ResolveFilesystemPath(inputPath);
         EnsureJsonl(sessionFilePath);
-        var outputDirectoryPath = ResolveOutputDirectory(sessionFilePath, outputDirectory);
+        var resolvedOutputPath = string.IsNullOrWhiteSpace(outputPath)
+            ? Path.Combine(ResolveOutputDirectory(sessionFilePath, outputDirectory), $"{Path.GetFileNameWithoutExtension(sessionFilePath)}.md")
+            : EnsureMarkdownOutputPath(ResolveFilesystemPath(outputPath));
+        var outputDirectoryPath = Path.GetDirectoryName(resolvedOutputPath)!;
         Directory.CreateDirectory(outputDirectoryPath);
-        var outputPath = Path.Combine(outputDirectoryPath, $"{Path.GetFileNameWithoutExtension(sessionFilePath)}.md");
         var meta = await ReadSessionExportMetadataAsync(sessionFilePath, cancellationToken);
         var fileSize = new FileInfo(sessionFilePath).Length;
         progress(new ExportJobStatus("working", 4, "reading", "Preparing Markdown export...", null));
 
-        var assetDirectoryName = $"{Path.GetFileNameWithoutExtension(outputPath)}-assets";
+        var assetDirectoryName = $"{Path.GetFileNameWithoutExtension(resolvedOutputPath)}-assets";
         var imageContext = new ExportImageContext(ExportImageRenderMode.Markdown, includeImages, false, outputDirectoryPath, assetDirectoryName);
         try
         {
-            await using var stream = File.Create(outputPath);
+            await using var stream = File.Create(resolvedOutputPath);
             await using var writer = new StreamWriter(stream, new UTF8Encoding(false));
             await writer.WriteLineAsync("# Claude Session Export");
             await writer.WriteLineAsync();
@@ -799,13 +1034,13 @@ public sealed class ClaudeSessionService
         }
         catch
         {
-            TryDeleteFile(outputPath);
+            TryDeleteFile(resolvedOutputPath);
             imageContext.CleanupAssetDirectory();
             throw;
         }
 
-        progress(new ExportJobStatus("working", 100, "writing", "Markdown export ready.", outputPath));
-        return outputPath;
+        progress(new ExportJobStatus("working", 100, "writing", "Markdown export ready.", resolvedOutputPath));
+        return resolvedOutputPath;
     }
 
     private async Task<string> ExportSessionJsonlToHtmlAsync(
@@ -978,6 +1213,35 @@ public sealed class ClaudeSessionService
     private void SetExportStatus(string jobId, ExportProgress progress)
         => SetExportStatus(jobId, new ExportJobStatus("working", progress.ProgressPercent, progress.Stage, progress.Message, null));
 
+    private void SetBatchExportStatus(string jobId, BatchExportJobStatus status)
+    {
+        lock (_gate)
+        {
+            if (_batchExportJobs.TryGetValue(jobId, out var record))
+            {
+                record.Status = status;
+            }
+        }
+    }
+
+    private void ScheduleBatchExportJobCleanup(string jobId, JobRecord<BatchExportJobStatus> completedRecord)
+    {
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(BatchExportJobRetention);
+            lock (_gate)
+            {
+                if (_batchExportJobs.TryGetValue(jobId, out var currentRecord)
+                    && ReferenceEquals(currentRecord, completedRecord)
+                    && currentRecord.Status.Kind != "working")
+                {
+                    _batchExportJobs.Remove(jobId);
+                    currentRecord.Cancellation.Dispose();
+                }
+            }
+        });
+    }
+
     private void SetSanitizedStatus(string jobId, ExportJobStatus status)
     {
         lock (_gate)
@@ -1063,6 +1327,7 @@ public sealed class ClaudeSessionService
     {
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var info = new FileInfo(filePath);
             if (!info.Exists)
             {
@@ -1110,10 +1375,16 @@ public sealed class ClaudeSessionService
             id ??= Path.GetFileNameWithoutExtension(filePath);
             cwd ??= DecodeClaudeProjectFolderPath(Path.GetFileName(Path.GetDirectoryName(filePath) ?? "")) ?? Path.GetDirectoryName(filePath) ?? "";
             updatedAt ??= startedAt ?? info.LastWriteTimeUtc.ToString("O");
+            cancellationToken.ThrowIfCancellationRequested();
             return new SessionProbe(id, info.Length, cwd, startedAt, updatedAt, threadName, source);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch
         {
+            cancellationToken.ThrowIfCancellationRequested();
             return null;
         }
     }
@@ -1523,39 +1794,9 @@ public sealed class ClaudeSessionService
         return total;
     }
 
-    private async Task<HashSet<string>> FindCandidateSessionFilesAsync(
-        IReadOnlyList<string> files,
-        List<ComparablePathAlias> aliases,
-        CancellationToken cancellationToken)
-    {
-        var matches = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var file in files)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            try
-            {
-                var probe = await ProbeSessionFileAsync(file, cancellationToken);
-                if (probe is not null && MatchesRootAliases(probe.Cwd, aliases))
-                {
-                    matches.Add(NormalizeFileLookupPath(file));
-                    continue;
-                }
-
-                if (await SessionTouchesRootAsync(file, aliases, probe?.Cwd, cancellationToken))
-                {
-                    matches.Add(NormalizeFileLookupPath(file));
-                }
-            }
-            catch
-            {
-            }
-        }
-
-        return matches;
-    }
-
     private async Task<bool> SessionTouchesRootAsync(string file, List<ComparablePathAlias> rootAliases, string? sessionCwd, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (!string.IsNullOrWhiteSpace(sessionCwd) && MatchesRootAliases(sessionCwd, rootAliases))
         {
             return true;
@@ -1566,8 +1807,10 @@ public sealed class ClaudeSessionService
         string? line;
         while ((line = await reader.ReadLineAsync(cancellationToken)) is not null)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             foreach (var candidate in ExtractPathCandidates(line))
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 if (MatchesRootAliases(candidate, rootAliases))
                 {
                     return true;
@@ -1575,6 +1818,7 @@ public sealed class ClaudeSessionService
             }
         }
 
+        cancellationToken.ThrowIfCancellationRequested();
         return false;
     }
 
@@ -1695,10 +1939,47 @@ public sealed class ClaudeSessionService
             : ResolveFilesystemPath(normalized);
     }
 
+    private static string EnsureMarkdownOutputPath(string path)
+        => string.Equals(Path.GetExtension(path), ".md", StringComparison.OrdinalIgnoreCase)
+            ? path
+            : $"{path}.md";
+
     private static string EnsureHtmlOutputPath(string path)
         => string.Equals(Path.GetExtension(path), ".html", StringComparison.OrdinalIgnoreCase) || string.Equals(Path.GetExtension(path), ".htm", StringComparison.OrdinalIgnoreCase)
             ? path
             : $"{path}.html";
+
+    private static string CreateAvailableBatchExportPath(
+        string outputDirectory,
+        string proposedName,
+        bool needsExternalAssets,
+        CancellationToken cancellationToken)
+    {
+        var extension = Path.GetExtension(proposedName);
+        var stem = Path.GetFileNameWithoutExtension(proposedName);
+        for (var suffix = 1; ; suffix++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var name = suffix == 1 ? proposedName : $"{stem}-{suffix}{extension}";
+            var path = Path.Combine(outputDirectory, name);
+            var assetPath = Path.Combine(outputDirectory, $"{Path.GetFileNameWithoutExtension(name)}-assets");
+            if (File.Exists(path)
+                || Directory.Exists(path)
+                || needsExternalAssets && (File.Exists(assetPath) || Directory.Exists(assetPath)))
+            {
+                continue;
+            }
+
+            try
+            {
+                using var reservation = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+                return path;
+            }
+            catch (IOException) when (File.Exists(path) || Directory.Exists(path))
+            {
+            }
+        }
+    }
 
     private static string DecodeClaudeProjectFolderPath(string folderName)
     {
@@ -2289,8 +2570,26 @@ public sealed class ClaudeSessionService
         return sanitized.Length == 0 ? "session" : sanitized[..Math.Min(80, sanitized.Length)];
     }
 
-    private static string NormalizeFileLookupPath(string path)
-        => Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).ToUpperInvariant();
+    private static string SanitizeBatchExportFileStem(string? value)
+    {
+        var normalized = SanitizeSessionTitleInput(value);
+        var invalid = Path.GetInvalidFileNameChars().ToHashSet();
+        invalid.UnionWith(['<', '>', ':', '"', '/', '\\', '|', '?', '*']);
+        var builder = new StringBuilder(normalized.Length);
+        foreach (var ch in normalized)
+        {
+            builder.Append(invalid.Contains(ch) || char.IsControl(ch) ? '-' : ch);
+        }
+
+        var sanitized = System.Text.RegularExpressions.Regex.Replace(builder.ToString(), @"\s+", " ");
+        sanitized = System.Text.RegularExpressions.Regex.Replace(sanitized, @"-+", "-").Trim(' ', '.', '-');
+        if (sanitized.Length == 0)
+        {
+            return "session";
+        }
+
+        return sanitized[..Math.Min(100, sanitized.Length)].TrimEnd(' ', '.');
+    }
 
     private static bool MatchesRootAliases(string candidatePath, List<ComparablePathAlias> rootAliases)
     {
@@ -2477,6 +2776,8 @@ public sealed class ClaudeSessionService
         private string OutputDirectory { get; } = outputDirectory;
         private string AssetDirectoryName { get; } = assetDirectoryName;
         private string AssetDirectoryPath => Path.Combine(OutputDirectory, AssetDirectoryName);
+        private List<string> CreatedAssetFiles { get; } = [];
+        private bool CreatedAssetDirectory { get; set; }
 
         public string? PersistImageReference(string source)
         {
@@ -2507,11 +2808,25 @@ public sealed class ClaudeSessionService
             try
             {
                 var bytes = Convert.FromBase64String(source[(comma + 1)..]);
+                var directoryExisted = Directory.Exists(AssetDirectoryPath);
                 Directory.CreateDirectory(AssetDirectoryPath);
-                var fileName = $"image-{NextImageIndex:000}.{extension}";
-                NextImageIndex++;
-                File.WriteAllBytes(Path.Combine(AssetDirectoryPath, fileName), bytes);
-                return $"./{AssetDirectoryName}/{fileName}";
+                CreatedAssetDirectory |= !directoryExisted;
+                while (true)
+                {
+                    var fileName = $"image-{NextImageIndex:000}.{extension}";
+                    NextImageIndex++;
+                    var filePath = Path.Combine(AssetDirectoryPath, fileName);
+                    try
+                    {
+                        using var stream = new FileStream(filePath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+                        stream.Write(bytes);
+                        CreatedAssetFiles.Add(filePath);
+                        return $"./{AssetDirectoryName}/{fileName}";
+                    }
+                    catch (IOException) when (File.Exists(filePath))
+                    {
+                    }
+                }
             }
             catch
             {
@@ -2521,11 +2836,21 @@ public sealed class ClaudeSessionService
 
         public void CleanupAssetDirectory()
         {
+            foreach (var file in CreatedAssetFiles)
+            {
+                TryDeleteFile(file);
+            }
+
+            if (!CreatedAssetDirectory)
+            {
+                return;
+            }
+
             try
             {
-                if (Directory.Exists(AssetDirectoryPath))
+                if (Directory.Exists(AssetDirectoryPath) && !Directory.EnumerateFileSystemEntries(AssetDirectoryPath).Any())
                 {
-                    Directory.Delete(AssetDirectoryPath, true);
+                    Directory.Delete(AssetDirectoryPath);
                 }
             }
             catch

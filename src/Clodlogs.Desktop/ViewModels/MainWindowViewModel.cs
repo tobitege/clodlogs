@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.Diagnostics;
+using Avalonia.Threading;
 using Clodlogs.Desktop.Models;
 using Clodlogs.Desktop.Services;
 
@@ -27,30 +28,41 @@ public sealed class MainWindowViewModel : ViewModelBase
     private bool _showArchivedSessions = true;
     private bool _isLoading;
     private bool _isDetailLoading;
+    private bool _startupLoadingVisible = true;
+    private string _startupLoadingMessage = "Loading saved settings...";
+    private bool _startupScanActive;
+    private string _partialSessionResultsMessage = "";
+    private CancellationTokenSource? _startupLoadCancellation;
+    private int _startupScannedFileCount;
+    private int _startupTotalFileCount;
+    private int _startupReportedScannedFileCount;
+    private bool _startupScanResultFinalized;
+    private readonly DispatcherTimer _startupProgressTimer;
     private string? _errorMessage;
     private string _statusMessage = "Ready";
     private string _browseMode = "folder";
     private bool _exportDialogVisible;
+    private bool _batchExportDialogVisible;
     private bool _exportProgressVisible;
     private bool _sanitizeDialogVisible;
     private bool _sanitizeProgressVisible;
     private bool _transcriptDialogVisible;
     private bool _tokenSummaryDialogVisible;
-    private bool _renameDialogVisible;
-    private bool _renameSessionPending;
-    private string _renameTitle = "";
     private string _exportFormat = "markdown";
     private bool _exportImages;
     private bool _exportInlineImages = true;
     private bool _exportToolCallResults;
+    private string _batchExportDirectory = "";
+    private bool _updatingBatchSelection;
     private string _operationTitle = "Ready";
     private string _operationMessage = "";
     private string _operationStage = "";
     private int _operationProgress;
     private string? _operationOutputPath;
-    private string? _activeExportJobId;
-    private string? _activeSanitizedJobId;
+    private string? _activeOperationKind;
+    private string? _activeOperationJobId;
     private string? _activeTokenSummaryJobId;
+    private int _metricsRequestVersion;
     private string _sanitizeChatName = "";
     private bool _sanitizeStripImageContent = true;
     private bool _sanitizeStripBlobContent;
@@ -66,10 +78,12 @@ public sealed class MainWindowViewModel : ViewModelBase
         _sessions = sessions;
         _ui = ui;
         _settings = settings;
+        _startupProgressTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(50) };
+        _startupProgressTimer.Tick += (_, _) => AdvanceStartupProgressDisplay();
 
-        RefreshCommand = new AsyncRelayCommand(() => LoadSessionsAsync(_browseMode));
-        BrowseFolderCommand = new AsyncRelayCommand(BrowseFolderAsync);
-        ShowAllSessionsCommand = new AsyncRelayCommand(() => LoadSessionsAsync("all"));
+        RefreshCommand = new AsyncRelayCommand(() => LoadSessionsAsync(_browseMode), () => !StartupScanActive && !IsLoading);
+        BrowseFolderCommand = new AsyncRelayCommand(BrowseFolderAsync, () => !StartupScanActive && !IsLoading);
+        ShowAllSessionsCommand = new AsyncRelayCommand(() => LoadSessionsAsync("all"), () => !StartupScanActive && !IsLoading);
         OpenRepositoryCommand = new RelayCommand(OpenRepository);
         AnalyzeAnywayCommand = new AsyncRelayCommand(() => LoadSelectedMetricsAsync(true), () => SelectedSession is not null);
         OpenTranscriptCommand = new AsyncRelayCommand(OpenTranscriptAsync, () => SelectedSession is not null);
@@ -77,14 +91,16 @@ public sealed class MainWindowViewModel : ViewModelBase
         ToggleTranscriptToolCallsCommand = new RelayCommand(() => ApplyTranscriptFilter(!TranscriptShowToolCalls));
         CopyTranscriptEntryCommand = new AsyncRelayCommand(CopyTranscriptEntryAsync);
         CopyAllTranscriptCommand = new AsyncRelayCommand(CopyAllTranscriptAsync);
-        OpenRenameDialogCommand = new RelayCommand(OpenRenameDialog, () => CanRenameSession);
-        ConfirmRenameCommand = new AsyncRelayCommand(ConfirmRenameAsync, () => CanRenameSession && !RenameSessionPending && !string.IsNullOrWhiteSpace(RenameTitle));
-        OpenExportDialogCommand = new RelayCommand(() => ExportDialogVisible = true, () => SelectedSession is not null);
-        ConfirmExportCommand = new AsyncRelayCommand(StartExportAsync, () => SelectedSession is not null);
-        CancelExportCommand = new RelayCommand(CancelExport);
-        OpenSanitizeDialogCommand = new RelayCommand(() => SanitizeDialogVisible = true, () => SelectedSession is not null);
-        ConfirmSanitizeCommand = new AsyncRelayCommand(StartSanitizeAsync, () => SelectedSession is not null);
-        CancelSanitizeCommand = new RelayCommand(CancelSanitize);
+        OpenExportDialogCommand = new RelayCommand(() => ExportDialogVisible = true, () => SelectedSession is not null && !IsOperationRunning);
+        ConfirmExportCommand = new AsyncRelayCommand(StartExportAsync, () => SelectedSession is not null && !IsOperationRunning);
+        OpenBatchExportDialogCommand = new AsyncRelayCommand(OpenBatchExportDialogAsync, () => FilteredSessions.Count > 0 && !IsOperationRunning);
+        SelectAllBatchExportCommand = new RelayCommand(() => SetAllBatchExportSelections(true));
+        ClearBatchExportCommand = new RelayCommand(() => SetAllBatchExportSelections(false));
+        BrowseBatchExportDirectoryCommand = new AsyncRelayCommand(BrowseBatchExportDirectoryAsync);
+        ConfirmBatchExportCommand = new AsyncRelayCommand(StartBatchExportAsync, () => CanStartBatchExport);
+        CancelOperationCommand = new RelayCommand(CancelOperation, () => IsOperationRunning);
+        OpenSanitizeDialogCommand = new RelayCommand(() => SanitizeDialogVisible = true, () => SelectedSession is not null && !IsOperationRunning);
+        ConfirmSanitizeCommand = new AsyncRelayCommand(StartSanitizeAsync, () => SelectedSession is not null && !IsOperationRunning);
         OpenTokenSummaryCommand = new AsyncRelayCommand(StartTokenSummaryAsync, () => FilteredSessions.Count > 0);
         CancelTokenSummaryCommand = new RelayCommand(CancelTokenSummary);
         CopySelectedTokenUsageCommand = new AsyncRelayCommand(CopySelectedTokenUsageAsync, () => SelectedMetrics?.TokenUsage is not null && SelectedSession is not null);
@@ -92,6 +108,7 @@ public sealed class MainWindowViewModel : ViewModelBase
         RevealOperationOutputCommand = new AsyncRelayCommand(RevealOperationOutputAsync, () => !string.IsNullOrWhiteSpace(OperationOutputPath));
         OpenSelectedFileCommand = new AsyncRelayCommand(() => SelectedSession is null ? Task.CompletedTask : _ui.OpenPathAsync(SelectedSession.File), () => SelectedSession is not null);
         RevealSelectedFileCommand = new AsyncRelayCommand(() => SelectedSession is null ? Task.CompletedTask : _ui.RevealPathAsync(SelectedSession.File), () => SelectedSession is not null);
+        StopStartupScanCommand = new RelayCommand(StopStartupScan, () => StartupScanActive);
         DismissDialogsCommand = new RelayCommand(DismissDialogs);
 
         _ = InitializeAsync();
@@ -99,6 +116,7 @@ public sealed class MainWindowViewModel : ViewModelBase
 
     public ObservableCollection<SessionCardViewModel> Sessions { get; } = [];
     public ObservableCollection<SessionCardViewModel> FilteredSessions { get; } = [];
+    public ObservableCollection<BatchExportSessionViewModel> BatchExportSessions { get; } = [];
     public ObservableCollection<TranscriptEntryViewModel> TranscriptEntries { get; } = [];
     public string[] ExportFormats { get; } = ["markdown", "html"];
 
@@ -112,14 +130,16 @@ public sealed class MainWindowViewModel : ViewModelBase
     public RelayCommand ToggleTranscriptToolCallsCommand { get; }
     public AsyncRelayCommand CopyTranscriptEntryCommand { get; }
     public AsyncRelayCommand CopyAllTranscriptCommand { get; }
-    public RelayCommand OpenRenameDialogCommand { get; }
-    public AsyncRelayCommand ConfirmRenameCommand { get; }
     public RelayCommand OpenExportDialogCommand { get; }
     public AsyncRelayCommand ConfirmExportCommand { get; }
-    public RelayCommand CancelExportCommand { get; }
+    public AsyncRelayCommand OpenBatchExportDialogCommand { get; }
+    public RelayCommand SelectAllBatchExportCommand { get; }
+    public RelayCommand ClearBatchExportCommand { get; }
+    public AsyncRelayCommand BrowseBatchExportDirectoryCommand { get; }
+    public AsyncRelayCommand ConfirmBatchExportCommand { get; }
+    public RelayCommand CancelOperationCommand { get; }
     public RelayCommand OpenSanitizeDialogCommand { get; }
     public AsyncRelayCommand ConfirmSanitizeCommand { get; }
-    public RelayCommand CancelSanitizeCommand { get; }
     public AsyncRelayCommand OpenTokenSummaryCommand { get; }
     public RelayCommand CancelTokenSummaryCommand { get; }
     public AsyncRelayCommand CopySelectedTokenUsageCommand { get; }
@@ -127,6 +147,7 @@ public sealed class MainWindowViewModel : ViewModelBase
     public AsyncRelayCommand RevealOperationOutputCommand { get; }
     public AsyncRelayCommand OpenSelectedFileCommand { get; }
     public AsyncRelayCommand RevealSelectedFileCommand { get; }
+    public RelayCommand StopStartupScanCommand { get; }
     public RelayCommand DismissDialogsCommand { get; }
 
     public string ClaudeHome
@@ -204,13 +225,62 @@ public sealed class MainWindowViewModel : ViewModelBase
     public bool IsLoading
     {
         get => _isLoading;
-        set => SetProperty(ref _isLoading, value);
+        set
+        {
+            if (SetProperty(ref _isLoading, value))
+            {
+                RefreshCommand.RaiseCanExecuteChanged();
+                BrowseFolderCommand.RaiseCanExecuteChanged();
+                ShowAllSessionsCommand.RaiseCanExecuteChanged();
+            }
+        }
     }
 
     public bool IsDetailLoading
     {
         get => _isDetailLoading;
         set => SetProperty(ref _isDetailLoading, value);
+    }
+
+    public bool StartupLoadingVisible
+    {
+        get => _startupLoadingVisible;
+        private set => SetProperty(ref _startupLoadingVisible, value);
+    }
+
+    public string StartupLoadingMessage
+    {
+        get => _startupLoadingMessage;
+        private set => SetProperty(ref _startupLoadingMessage, value);
+    }
+
+    public bool StartupScanActive
+    {
+        get => _startupScanActive;
+        private set
+        {
+            if (SetProperty(ref _startupScanActive, value))
+            {
+                StopStartupScanCommand.RaiseCanExecuteChanged();
+                RefreshCommand.RaiseCanExecuteChanged();
+                BrowseFolderCommand.RaiseCanExecuteChanged();
+                ShowAllSessionsCommand.RaiseCanExecuteChanged();
+            }
+        }
+    }
+
+    public bool HasPartialSessionResults => !string.IsNullOrWhiteSpace(PartialSessionResultsMessage);
+
+    public string PartialSessionResultsMessage
+    {
+        get => _partialSessionResultsMessage;
+        private set
+        {
+            if (SetProperty(ref _partialSessionResultsMessage, value))
+            {
+                OnPropertyChanged(nameof(HasPartialSessionResults));
+            }
+        }
     }
 
     public string? ErrorMessage
@@ -248,8 +318,6 @@ public sealed class MainWindowViewModel : ViewModelBase
                 OnPropertyChanged(nameof(SelectedStartedAt));
                 OnPropertyChanged(nameof(SelectedUpdatedAt));
                 OnPropertyChanged(nameof(SelectedSource));
-                OnPropertyChanged(nameof(CanRenameSession));
-                OnPropertyChanged(nameof(RenameSessionDisabledReason));
                 RaiseCommandState();
                 _ = LoadSelectedMetricsAsync(false);
             }
@@ -330,11 +398,20 @@ public sealed class MainWindowViewModel : ViewModelBase
         set => SetProperty(ref _exportDialogVisible, value);
     }
 
+    public bool BatchExportDialogVisible
+    {
+        get => _batchExportDialogVisible;
+        set => SetProperty(ref _batchExportDialogVisible, value);
+    }
+
     public bool ExportProgressVisible
     {
         get => _exportProgressVisible;
         set => SetProperty(ref _exportProgressVisible, value);
     }
+
+    public bool IsOperationRunning => _activeOperationKind is not null;
+    public bool CanCloseOperationProgress => !IsOperationRunning;
 
     public bool SanitizeDialogVisible
     {
@@ -360,44 +437,38 @@ public sealed class MainWindowViewModel : ViewModelBase
         set => SetProperty(ref _tokenSummaryDialogVisible, value);
     }
 
-    public bool RenameDialogVisible
-    {
-        get => _renameDialogVisible;
-        set => SetProperty(ref _renameDialogVisible, value);
-    }
-
-    public bool RenameSessionPending
-    {
-        get => _renameSessionPending;
-        set
-        {
-            if (SetProperty(ref _renameSessionPending, value))
-            {
-                ConfirmRenameCommand.RaiseCanExecuteChanged();
-            }
-        }
-    }
-
-    public string RenameTitle
-    {
-        get => _renameTitle;
-        set
-        {
-            if (SetProperty(ref _renameTitle, ClaudeSessionService.SanitizeSessionTitleInput(value)))
-            {
-                ConfirmRenameCommand.RaiseCanExecuteChanged();
-            }
-        }
-    }
-
-    public bool CanRenameSession => false;
-    public string RenameSessionDisabledReason => "Claude project-log sessions cannot be renamed from clodlogs.";
 
     public string ExportFormat
     {
         get => _exportFormat;
-        set => SetProperty(ref _exportFormat, value);
+        set
+        {
+            if (SetProperty(ref _exportFormat, value))
+            {
+                foreach (var session in BatchExportSessions)
+                {
+                    session.RefreshOutputFileName(value);
+                }
+            }
+        }
     }
+
+    public string BatchExportDirectory
+    {
+        get => _batchExportDirectory;
+        set
+        {
+            if (SetProperty(ref _batchExportDirectory, value))
+            {
+                OnPropertyChanged(nameof(CanStartBatchExport));
+                ConfirmBatchExportCommand.RaiseCanExecuteChanged();
+            }
+        }
+    }
+
+    public int BatchExportSelectedCount => BatchExportSessions.Count(session => session.IsSelected);
+    public string BatchExportSelectionText => $"{BatchExportSelectedCount:n0} of {BatchExportSessions.Count:n0} sessions selected";
+    public bool CanStartBatchExport => !IsOperationRunning && BatchExportSelectedCount > 0 && IsValidDirectoryPath(BatchExportDirectory);
 
     public bool ExportImages
     {
@@ -529,6 +600,8 @@ public sealed class MainWindowViewModel : ViewModelBase
                 OnPropertyChanged(nameof(TokenSummaryMessage));
                 OnPropertyChanged(nameof(TokenSummaryProgress));
                 OnPropertyChanged(nameof(TokenSummaryResultText));
+                OnPropertyChanged(nameof(IsTokenSummaryRunning));
+                OnPropertyChanged(nameof(CanCloseTokenSummary));
                 CopyTokenSummaryCommand.RaiseCanExecuteChanged();
             }
         }
@@ -545,6 +618,8 @@ public sealed class MainWindowViewModel : ViewModelBase
 
     public string TokenSummaryMessage => TokenSummaryStatus?.Message ?? "";
     public int TokenSummaryProgress => TokenSummaryStatus?.ProgressPercent ?? 0;
+    public bool IsTokenSummaryRunning => TokenSummaryStatus?.Kind == "working";
+    public bool CanCloseTokenSummary => !IsTokenSummaryRunning;
     public string TokenSummaryResultText
     {
         get
@@ -561,17 +636,54 @@ public sealed class MainWindowViewModel : ViewModelBase
 
     private async Task InitializeAsync()
     {
-        var appSettings = await _settings.ReadAsync();
-        FolderPath = appSettings.LastOpenedFolder ?? System.Environment.CurrentDirectory;
-        await RefreshEnvironmentAsync();
-        await LoadSessionsAsync("folder");
+        try
+        {
+            StartupLoadingMessage = "Loading saved settings...";
+            var appSettings = await _settings.ReadAsync();
+            FolderPath = appSettings.LastOpenedFolder ?? System.Environment.CurrentDirectory;
+            StartupLoadingMessage = "Checking the Claude environment...";
+            await RefreshEnvironmentAsync();
+            StartupLoadingMessage = "Scanning the session folder. Large histories can take a while...";
+            _startupLoadCancellation = new CancellationTokenSource();
+            _startupScanResultFinalized = false;
+            _startupScannedFileCount = 0;
+            _startupReportedScannedFileCount = 0;
+            _startupTotalFileCount = 0;
+            StartupScanActive = true;
+            _startupProgressTimer.Start();
+            var progress = new Progress<SessionScanProgress>(ApplyStartupScanProgress);
+            await LoadSessionsAsync("folder", _startupLoadCancellation.Token, progress);
+            if (StartupLoadingVisible && _result?.IsComplete == true)
+            {
+                while (_startupScannedFileCount < _startupReportedScannedFileCount)
+                {
+                    await Task.Delay(50);
+                }
+                StartupLoadingMessage = $"Scan complete: {_result.ScannedFileCount:n0} of {_result.TotalFileCount:n0} session files. Opening the session list...";
+                await Task.Delay(150);
+            }
+        }
+        catch (Exception ex)
+        {
+            ErrorMessage = ex.Message;
+            StatusMessage = "Startup failed.";
+        }
+        finally
+        {
+            _startupProgressTimer.Stop();
+            StartupScanActive = false;
+            _startupLoadCancellation?.Dispose();
+            _startupLoadCancellation = null;
+            StartupLoadingVisible = false;
+        }
     }
 
     private async Task RefreshEnvironmentAsync()
     {
         try
         {
-            Environment = await _sessions.GetEnvironmentCapabilitiesAsync(string.IsNullOrWhiteSpace(ClaudeHome) ? null : ClaudeHome);
+            var claudeHome = string.IsNullOrWhiteSpace(ClaudeHome) ? null : ClaudeHome;
+            Environment = await Task.Run(() => _sessions.GetEnvironmentCapabilitiesAsync(claudeHome));
         }
         catch (Exception ex)
         {
@@ -591,21 +703,44 @@ public sealed class MainWindowViewModel : ViewModelBase
         await LoadSessionsAsync("folder");
     }
 
-    private async Task LoadSessionsAsync(string browseMode)
+    private async Task LoadSessionsAsync(
+        string browseMode,
+        CancellationToken cancellationToken = default,
+        IProgress<SessionScanProgress>? progress = null)
     {
         IsLoading = true;
         ErrorMessage = null;
         _browseMode = browseMode;
+        if (progress is not null)
+        {
+            Sessions.Clear();
+            FilteredSessions.Clear();
+            SelectedSession = null;
+            RefreshHeaderProperties();
+        }
         try
         {
             var target = browseMode == "all" ? null : FolderPath;
-            _result = await _sessions.FindClaudeSessionsAsync(
-                string.IsNullOrWhiteSpace(ClaudeHome) ? null : ClaudeHome,
+            var claudeHome = string.IsNullOrWhiteSpace(ClaudeHome) ? null : ClaudeHome;
+            var cwdOnly = CwdOnly;
+            var dateFrom = string.IsNullOrWhiteSpace(DateFrom) ? null : DateFrom;
+            var dateTo = string.IsNullOrWhiteSpace(DateTo) ? null : DateTo;
+            var includeCrossSessionWrites = IncludeCrossSessionWrites;
+            _result = await Task.Run(() => _sessions.FindClaudeSessionsAsync(
+                claudeHome,
                 target,
-                CwdOnly,
-                string.IsNullOrWhiteSpace(DateFrom) ? null : DateFrom,
-                string.IsNullOrWhiteSpace(DateTo) ? null : DateTo,
-                IncludeCrossSessionWrites);
+                cwdOnly,
+                dateFrom,
+                dateTo,
+                includeCrossSessionWrites,
+                progress: progress,
+                cancellationToken: cancellationToken));
+            if (progress is not null)
+            {
+                _startupScanResultFinalized = true;
+                _startupReportedScannedFileCount = _result.ScannedFileCount;
+                _startupTotalFileCount = _result.TotalFileCount;
+            }
             Sessions.Clear();
             foreach (var session in _result.Sessions)
             {
@@ -614,7 +749,12 @@ public sealed class MainWindowViewModel : ViewModelBase
 
             ApplyFilters();
             SelectedSession = FilteredSessions.FirstOrDefault();
-            StatusMessage = $"Loaded {Sessions.Count:n0} session{(Sessions.Count == 1 ? "" : "s")}.";
+            PartialSessionResultsMessage = _result.IsComplete
+                ? ""
+                : BuildPartialSessionResultsMessage(_result.ScannedFileCount, _result.TotalFileCount, Sessions.Count);
+            StatusMessage = _result.IsComplete
+                ? $"Loaded {Sessions.Count:n0} session{(Sessions.Count == 1 ? "" : "s")} after scanning {_result.ScannedFileCount:n0} session file{(_result.ScannedFileCount == 1 ? "" : "s")}."
+                : $"Showing {Sessions.Count:n0} partial session result{(Sessions.Count == 1 ? "" : "s")}. Use Refresh to complete the scan.";
         }
         catch (Exception ex)
         {
@@ -627,6 +767,57 @@ public sealed class MainWindowViewModel : ViewModelBase
             RefreshHeaderProperties();
         }
     }
+
+    private void ApplyStartupScanProgress(SessionScanProgress progress)
+    {
+        if (_startupScanResultFinalized)
+        {
+            return;
+        }
+
+        _startupReportedScannedFileCount = progress.ScannedFileCount;
+        _startupTotalFileCount = progress.TotalFileCount;
+        if (progress.Match is null || Sessions.Any(session => string.Equals(session.File, progress.Match.File, StringComparison.OrdinalIgnoreCase)))
+        {
+            return;
+        }
+
+        Sessions.Add(new SessionCardViewModel(progress.Match));
+        if (!StartupLoadingVisible)
+        {
+            ApplyFilters();
+            PartialSessionResultsMessage = BuildPartialSessionResultsMessage(_startupScannedFileCount, _startupTotalFileCount, Sessions.Count);
+        }
+    }
+
+    private void StopStartupScan()
+    {
+        if (!StartupScanActive)
+        {
+            return;
+        }
+
+        _startupLoadCancellation?.Cancel();
+        StartupLoadingVisible = false;
+        PartialSessionResultsMessage = BuildPartialSessionResultsMessage(_startupScannedFileCount, _startupTotalFileCount, Sessions.Count);
+        ApplyFilters();
+        StatusMessage = $"Showing {Sessions.Count:n0} partial session result{(Sessions.Count == 1 ? "" : "s")}. Use Refresh to complete the scan.";
+    }
+
+    private void AdvanceStartupProgressDisplay()
+    {
+        var target = _startupReportedScannedFileCount;
+        if (_startupScannedFileCount < target)
+        {
+            var remaining = target - _startupScannedFileCount;
+            _startupScannedFileCount += Math.Max(1, (int)Math.Ceiling(remaining / 10d));
+        }
+
+        StartupLoadingMessage = $"Scanning session files: {_startupScannedFileCount:n0} of {_startupTotalFileCount:n0}...";
+    }
+
+    private static string BuildPartialSessionResultsMessage(int scannedFileCount, int totalFileCount, int sessionCount)
+        => $"Partial results: scan stopped after {scannedFileCount:n0} of {totalFileCount:n0} session files; {sessionCount:n0} session{(sessionCount == 1 ? "" : "s")} found. Use Refresh to complete the list.";
 
     private void ApplyFilters()
     {
@@ -657,9 +848,12 @@ public sealed class MainWindowViewModel : ViewModelBase
 
     private async Task LoadSelectedMetricsAsync(bool forceDeepAnalysis)
     {
-        if (SelectedSession is null)
+        var requestVersion = ++_metricsRequestVersion;
+        var session = SelectedSession;
+        if (session is null)
         {
             SelectedMetrics = null;
+            IsDetailLoading = false;
             return;
         }
 
@@ -667,16 +861,26 @@ public sealed class MainWindowViewModel : ViewModelBase
         SelectedMetrics = null;
         try
         {
-            SelectedMetrics = await _sessions.GetSessionDetailMetricsAsync(SelectedSession.File, forceDeepAnalysis);
+            var metrics = await Task.Run(() => _sessions.GetSessionDetailMetricsAsync(session.File, forceDeepAnalysis));
+            if (requestVersion == _metricsRequestVersion && ReferenceEquals(SelectedSession, session))
+            {
+                SelectedMetrics = metrics;
+            }
         }
         catch (Exception ex)
         {
-            StatusMessage = ex.Message;
+            if (requestVersion == _metricsRequestVersion)
+            {
+                StatusMessage = ex.Message;
+            }
         }
         finally
         {
-            IsDetailLoading = false;
-            OnPropertyChanged(nameof(InteractionSummary));
+            if (requestVersion == _metricsRequestVersion)
+            {
+                IsDetailLoading = false;
+                OnPropertyChanged(nameof(InteractionSummary));
+            }
         }
     }
 
@@ -693,7 +897,8 @@ public sealed class MainWindowViewModel : ViewModelBase
         StatusMessage = "Reading session transcript...";
         try
         {
-            _transcript = await _sessions.ReadSessionTranscriptAsync(SelectedSession.File, SessionBrowserMaxEntries);
+            var sessionFile = SelectedSession.File;
+            _transcript = await Task.Run(() => _sessions.ReadSessionTranscriptAsync(sessionFile, SessionBrowserMaxEntries));
             ApplyTranscriptFilter(TranscriptShowToolCalls);
             StatusMessage = "Transcript loaded.";
         }
@@ -761,44 +966,6 @@ public sealed class MainWindowViewModel : ViewModelBase
         StatusMessage = "Transcript copied.";
     }
 
-    private void OpenRenameDialog()
-    {
-        if (!CanRenameSession || SelectedSession is null)
-        {
-            StatusMessage = RenameSessionDisabledReason;
-            return;
-        }
-
-        RenameTitle = SelectedSession.Title;
-        RenameDialogVisible = true;
-    }
-
-    private async Task ConfirmRenameAsync()
-    {
-        if (!CanRenameSession || SelectedSession is null)
-        {
-            StatusMessage = RenameSessionDisabledReason;
-            return;
-        }
-
-        RenameSessionPending = true;
-        try
-        {
-            await _sessions.RenameSessionThreadNameAsync(string.IsNullOrWhiteSpace(ClaudeHome) ? null : ClaudeHome, SelectedSession.Id, RenameTitle);
-            RenameDialogVisible = false;
-            await LoadSessionsAsync(_browseMode);
-        }
-        catch (Exception ex)
-        {
-            StatusMessage = ex.Message;
-            await _ui.ShowMessageAsync("Rename unavailable", ex.Message);
-        }
-        finally
-        {
-            RenameSessionPending = false;
-        }
-    }
-
     private async Task StartExportAsync()
     {
         if (SelectedSession is null)
@@ -823,10 +990,127 @@ public sealed class MainWindowViewModel : ViewModelBase
         ExportProgressVisible = true;
         OperationTitle = "Exporting...";
         OperationMessage = "Preparing export...";
+        OperationStage = "starting";
         OperationProgress = 2;
         OperationOutputPath = null;
-        _activeExportJobId = _sessions.StartExportJob(ExportFormat, SelectedSession.File, ExportImages, ExportInlineImages, ExportToolCallResults, outputDirectory, outputPath).JobId;
-        await PollExportJobAsync(_activeExportJobId);
+        var jobId = _sessions.StartExportJob(ExportFormat, SelectedSession.File, ExportImages, ExportInlineImages, ExportToolCallResults, outputDirectory, outputPath).JobId;
+        SetActiveOperation("export", jobId);
+        try
+        {
+            await PollExportJobAsync(jobId);
+        }
+        finally
+        {
+            ClearActiveOperation(jobId);
+        }
+    }
+
+    private async Task OpenBatchExportDialogAsync()
+    {
+        if (FilteredSessions.Count == 0)
+        {
+            return;
+        }
+
+        var appSettings = await _settings.ReadAsync();
+        BatchExportDirectory = appSettings.ExportDirectory ?? GetDefaultBatchExportDirectory();
+        BatchExportSessions.Clear();
+        foreach (var session in FilteredSessions)
+        {
+            BatchExportSessions.Add(new BatchExportSessionViewModel(session, ExportFormat, OnBatchExportSelectionChanged));
+        }
+
+        OnBatchExportSelectionChanged();
+        BatchExportDialogVisible = true;
+    }
+
+    private void SetAllBatchExportSelections(bool isSelected)
+    {
+        _updatingBatchSelection = true;
+        try
+        {
+            foreach (var session in BatchExportSessions)
+            {
+                session.IsSelected = isSelected;
+            }
+        }
+        finally
+        {
+            _updatingBatchSelection = false;
+        }
+
+        OnBatchExportSelectionChanged();
+    }
+
+    private void OnBatchExportSelectionChanged()
+    {
+        if (_updatingBatchSelection)
+        {
+            return;
+        }
+
+        OnPropertyChanged(nameof(BatchExportSelectedCount));
+        OnPropertyChanged(nameof(BatchExportSelectionText));
+        OnPropertyChanged(nameof(CanStartBatchExport));
+        ConfirmBatchExportCommand.RaiseCanExecuteChanged();
+    }
+
+    private async Task BrowseBatchExportDirectoryAsync()
+    {
+        var selected = await _ui.PickExportDirectoryFromAsync(BatchExportDirectory);
+        if (selected is not null)
+        {
+            BatchExportDirectory = selected;
+        }
+    }
+
+    private async Task StartBatchExportAsync()
+    {
+        var selected = BatchExportSessions
+            .Where(session => session.IsSelected)
+            .Select(session => new BatchExportSessionRequest(session.File, session.Title, session.StartedAt))
+            .ToArray();
+        if (selected.Length == 0 || !IsValidDirectoryPath(BatchExportDirectory))
+        {
+            return;
+        }
+
+        var outputDirectory = Path.GetFullPath(BatchExportDirectory.Trim());
+        await _settings.UpdateAsync(settings => settings.ExportDirectory = outputDirectory);
+        BatchExportDirectory = outputDirectory;
+        BatchExportDialogVisible = false;
+        ExportProgressVisible = true;
+        OperationTitle = "Batch exporting...";
+        OperationMessage = $"Preparing {selected.Length} sessions...";
+        OperationStage = "starting";
+        OperationProgress = 1;
+        OperationOutputPath = outputDirectory;
+        var jobId = _sessions.StartBatchExportJob(
+            ExportFormat,
+            selected,
+            ExportImages,
+            ExportInlineImages,
+            ExportToolCallResults,
+            outputDirectory).JobId;
+        SetActiveOperation("batch", jobId);
+        try
+        {
+            while (true)
+            {
+                var status = _sessions.GetBatchExportJobStatus(jobId);
+                ApplyBatchOperationStatus(status);
+                if (status.Kind != "working")
+                {
+                    break;
+                }
+
+                await Task.Delay(250);
+            }
+        }
+        finally
+        {
+            ClearActiveOperation(jobId);
+        }
     }
 
     private async Task PollExportJobAsync(string jobId)
@@ -844,14 +1128,6 @@ public sealed class MainWindowViewModel : ViewModelBase
         }
     }
 
-    private void CancelExport()
-    {
-        if (_activeExportJobId is not null)
-        {
-            _sessions.CancelExportJob(_activeExportJobId);
-        }
-    }
-
     private async Task StartSanitizeAsync()
     {
         if (SelectedSession is null)
@@ -863,9 +1139,10 @@ public sealed class MainWindowViewModel : ViewModelBase
         SanitizeProgressVisible = true;
         OperationTitle = "Creating sanitized output...";
         OperationMessage = "Preparing sanitized session output...";
+        OperationStage = "starting";
         OperationProgress = 2;
         OperationOutputPath = null;
-        _activeSanitizedJobId = _sessions.StartSanitizedCopyJob(
+        var jobId = _sessions.StartSanitizedCopyJob(
             SelectedSession.File,
             string.IsNullOrWhiteSpace(ClaudeHome) ? null : ClaudeHome,
             SanitizeChatName,
@@ -873,7 +1150,15 @@ public sealed class MainWindowViewModel : ViewModelBase
             SanitizeStripBlobContent,
             SanitizeCreateJsonlCopy,
             SanitizeReAddToCurrentDay).JobId;
-        await PollSanitizedJobAsync(_activeSanitizedJobId);
+        SetActiveOperation("sanitize", jobId);
+        try
+        {
+            await PollSanitizedJobAsync(jobId);
+        }
+        finally
+        {
+            ClearActiveOperation(jobId);
+        }
     }
 
     private async Task PollSanitizedJobAsync(string jobId)
@@ -891,12 +1176,58 @@ public sealed class MainWindowViewModel : ViewModelBase
         }
     }
 
-    private void CancelSanitize()
+    private void CancelOperation()
     {
-        if (_activeSanitizedJobId is not null)
+        if (_activeOperationJobId is null)
         {
-            _sessions.CancelSanitizedCopyJob(_activeSanitizedJobId);
+            return;
         }
+
+        switch (_activeOperationKind)
+        {
+            case "export":
+                _sessions.CancelExportJob(_activeOperationJobId);
+                break;
+            case "batch":
+                _sessions.CancelBatchExportJob(_activeOperationJobId);
+                break;
+            case "sanitize":
+                _sessions.CancelSanitizedCopyJob(_activeOperationJobId);
+                break;
+        }
+    }
+
+    private void SetActiveOperation(string kind, string jobId)
+    {
+        _activeOperationKind = kind;
+        _activeOperationJobId = jobId;
+        RaiseOperationState();
+    }
+
+    private void ClearActiveOperation(string jobId)
+    {
+        if (!string.Equals(_activeOperationJobId, jobId, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        _activeOperationKind = null;
+        _activeOperationJobId = null;
+        RaiseOperationState();
+    }
+
+    private void RaiseOperationState()
+    {
+        OnPropertyChanged(nameof(IsOperationRunning));
+        OnPropertyChanged(nameof(CanCloseOperationProgress));
+        OnPropertyChanged(nameof(CanStartBatchExport));
+        OpenExportDialogCommand.RaiseCanExecuteChanged();
+        ConfirmExportCommand.RaiseCanExecuteChanged();
+        OpenBatchExportDialogCommand.RaiseCanExecuteChanged();
+        ConfirmBatchExportCommand.RaiseCanExecuteChanged();
+        OpenSanitizeDialogCommand.RaiseCanExecuteChanged();
+        ConfirmSanitizeCommand.RaiseCanExecuteChanged();
+        CancelOperationCommand.RaiseCanExecuteChanged();
     }
 
     private async Task StartTokenSummaryAsync()
@@ -949,9 +1280,14 @@ public sealed class MainWindowViewModel : ViewModelBase
 
     private async Task RevealOperationOutputAsync()
     {
-        if (!string.IsNullOrWhiteSpace(OperationOutputPath))
+        if (string.IsNullOrWhiteSpace(OperationOutputPath))
         {
-            await _ui.RevealPathAsync(OperationOutputPath);
+            return;
+        }
+
+        if (!await _ui.RevealPathAsync(OperationOutputPath))
+        {
+            StatusMessage = $"Output path is unavailable: {OperationOutputPath}";
         }
     }
 
@@ -965,19 +1301,43 @@ public sealed class MainWindowViewModel : ViewModelBase
             _ => "Working..."
         };
         OperationMessage = status.Message;
-        OperationStage = status.Stage;
+        OperationStage = FormatOperationStage(status.Stage);
         OperationProgress = status.ProgressPercent;
         OperationOutputPath = status.OutputPath;
     }
 
+    private void ApplyBatchOperationStatus(BatchExportJobStatus status)
+    {
+        OperationTitle = status.Kind switch
+        {
+            "success" => "Batch export complete",
+            "partial" => "Batch export partially complete",
+            "error" => "Batch export failed",
+            "cancelled" => "Batch export cancelled",
+            _ => "Batch exporting..."
+        };
+        OperationMessage = status.Message;
+        OperationStage = status.Result?.Failures.FirstOrDefault() is { } failure
+            ? $"First failure: {Path.GetFileName(failure.SessionFilePath)}: {failure.Message}"
+            : FormatOperationStage(status.Stage);
+        OperationProgress = status.ProgressPercent;
+        OperationOutputPath = status.OutputDirectory;
+    }
+
+    private static string FormatOperationStage(string stage)
+        => string.Equals(stage, "done", StringComparison.OrdinalIgnoreCase) ? "Done." : stage;
+
     private void DismissDialogs()
     {
         ExportDialogVisible = false;
-        ExportProgressVisible = false;
+        BatchExportDialogVisible = false;
+        if (!IsOperationRunning)
+        {
+            ExportProgressVisible = false;
+            SanitizeProgressVisible = false;
+        }
         SanitizeDialogVisible = false;
-        SanitizeProgressVisible = false;
         TokenSummaryDialogVisible = false;
-        RenameDialogVisible = false;
     }
 
     private void RefreshHeaderProperties()
@@ -989,14 +1349,13 @@ public sealed class MainWindowViewModel : ViewModelBase
         OnPropertyChanged(nameof(ClaudeHomeText));
         OnPropertyChanged(nameof(TotalSizeText));
         OpenTokenSummaryCommand.RaiseCanExecuteChanged();
+        OpenBatchExportDialogCommand.RaiseCanExecuteChanged();
     }
 
     private void RaiseCommandState()
     {
         AnalyzeAnywayCommand.RaiseCanExecuteChanged();
         OpenTranscriptCommand.RaiseCanExecuteChanged();
-        OpenRenameDialogCommand.RaiseCanExecuteChanged();
-        ConfirmRenameCommand.RaiseCanExecuteChanged();
         OpenExportDialogCommand.RaiseCanExecuteChanged();
         OpenSanitizeDialogCommand.RaiseCanExecuteChanged();
         ConfirmExportCommand.RaiseCanExecuteChanged();
@@ -1004,6 +1363,37 @@ public sealed class MainWindowViewModel : ViewModelBase
         CopySelectedTokenUsageCommand.RaiseCanExecuteChanged();
         OpenSelectedFileCommand.RaiseCanExecuteChanged();
         RevealSelectedFileCommand.RaiseCanExecuteChanged();
+    }
+
+    private static bool IsValidDirectoryPath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return false;
+        }
+
+        try
+        {
+            _ = Path.GetFullPath(path.Trim());
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private string GetDefaultBatchExportDirectory()
+    {
+        var baseDirectory = IsValidDirectoryPath(FolderPath)
+            ? Path.GetFullPath(FolderPath.Trim())
+            : System.Environment.GetFolderPath(System.Environment.SpecialFolder.MyDocuments);
+        if (!IsValidDirectoryPath(baseDirectory))
+        {
+            baseDirectory = System.Environment.CurrentDirectory;
+        }
+
+        return Path.Combine(baseDirectory, "export");
     }
 
     private static void OpenRepository()

@@ -33,7 +33,15 @@ public sealed record FindClaudeSessionsResult(
     int SessionCount,
     int LiveCount,
     int ArchivedCount,
-    IReadOnlyList<SessionMetaMatch> Sessions);
+    IReadOnlyList<SessionMetaMatch> Sessions,
+    int ScannedFileCount,
+    int TotalFileCount,
+    bool IsComplete);
+
+public sealed record SessionScanProgress(
+    int ScannedFileCount,
+    int TotalFileCount,
+    SessionMetaMatch? Match);
 
 public sealed record SessionTokenUsage(
     long InputTokens,
@@ -119,6 +127,26 @@ public sealed record ExportJobStatus(
     string Stage,
     string Message,
     string? OutputPath);
+
+public sealed record BatchExportSessionRequest(
+    string SessionFilePath,
+    string SessionName,
+    string? StartedAt);
+
+public sealed record BatchExportFailure(
+    string SessionFilePath,
+    string Message);
+
+public sealed record BatchExportResult(
+    IReadOnlyList<BatchExportFailure> Failures);
+
+public sealed record BatchExportJobStatus(
+    string Kind,
+    int ProgressPercent,
+    string Stage,
+    string Message,
+    string? OutputDirectory,
+    BatchExportResult? Result);
 
 public sealed record TokenUsageSummaryJobStatus(
     string Kind,

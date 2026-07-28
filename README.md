@@ -124,3 +124,11 @@ Current behavior:
 - offers `Analyze Anyway` for a bounded manual scan when automatic analysis is skipped
 - treats oversized JSONL rows as partial-analysis conditions instead of crashing normal inspection
 - streams Markdown and HTML export so large session files do not require whole-file reads during export
+
+## Changelog
+
+### 1.0.3
+
+- Added the native Avalonia Windows desktop app for browsing, replaying, analyzing, sanitizing, and exporting Claude sessions.
+- Added collision-safe Markdown and HTML batch export for selected sessions from the filtered list.
+- Added responsive, cancellable startup scanning with partial results and explicit completion status.
