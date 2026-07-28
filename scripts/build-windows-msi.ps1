@@ -11,7 +11,7 @@ param(
     [string] $ProductName = "clodlogs",
     [string] $Manufacturer = "clodlogs",
     [string] $UpgradeCode = "4f7b5b83-2c89-4e69-8d1e-0c383477470c",
-    [string] $ShortcutTarget = ""
+    [string] $ShortcutTarget = "Clodlogs.Desktop.exe"
 )
 
 Set-StrictMode -Version Latest
@@ -96,27 +96,6 @@ $outputDir = Split-Path -Parent $resolvedOutputPath
 $workDir = Join-Path $outputDir "wix-work"
 $wxsPath = Join-Path $workDir "clodlogs.wxs"
 $wixObjPath = Join-Path $workDir "clodlogs.wixobj"
-
-if ([string]::IsNullOrWhiteSpace($ShortcutTarget)) {
-    $shortcutCandidates = @(
-        "bin\launcher.exe",
-        "bin\launcher",
-        "bin\$ProductName.exe",
-        "bin\$ProductName"
-    )
-
-    foreach ($candidate in $shortcutCandidates) {
-        $candidatePath = Join-Path $resolvedSourceDir $candidate
-        if (Test-Path -LiteralPath $candidatePath) {
-            $ShortcutTarget = $candidate
-            break
-        }
-    }
-}
-
-if ([string]::IsNullOrWhiteSpace($ShortcutTarget)) {
-    throw "Could not detect an application launcher under $resolvedSourceDir."
-}
 
 $shortcutTargetPath = Join-Path $resolvedSourceDir $ShortcutTarget
 if (-not (Test-Path -LiteralPath $shortcutTargetPath)) {
