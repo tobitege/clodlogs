@@ -1,4 +1,4 @@
-namespace Clodlogs.Desktop.Services;
+﻿namespace Clodlogs.Desktop.Services;
 
 public interface IUiService
 {
@@ -6,6 +6,8 @@ public interface IUiService
     Task<string?> PickExportDirectoryAsync(string sessionFilePath);
     Task<string?> PickExportDirectoryFromAsync(string? startingFolder);
     Task<string?> PickHtmlExportDestinationAsync(string sessionFilePath, bool includeImages, bool inlineImages);
+    Task<string?> SaveStatisticsTextAsync(string suggestedFileName, string extension, string content);
+    Task<string?> SaveStatisticsImageAsync(string suggestedFileName);
     Task CopyTextAsync(string text);
     Task<bool> OpenPathAsync(string path);
     Task<bool> RevealPathAsync(string path);

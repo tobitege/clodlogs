@@ -1,4 +1,4 @@
-namespace Clodlogs.Desktop.Models;
+﻿namespace Clodlogs.Desktop.Models;
 
 public enum SessionKind
 {
@@ -45,21 +45,68 @@ public sealed record SessionScanProgress(
 
 public sealed record SessionTokenUsage(
     long InputTokens,
-    long CachedInputTokens,
+    long CacheCreation5MinuteInputTokens,
+    long CacheCreation1HourInputTokens,
+    long CacheReadInputTokens,
     long OutputTokens,
     long ReasoningOutputTokens,
     long TotalTokens)
 {
-    public static SessionTokenUsage Empty { get; } = new(0, 0, 0, 0, 0);
+    public static SessionTokenUsage Empty { get; } = new(0, 0, 0, 0, 0, 0, 0);
+
+    public long CacheCreationInputTokens => CacheCreation5MinuteInputTokens + CacheCreation1HourInputTokens;
+    public long CachedInputTokens => CacheCreationInputTokens + CacheReadInputTokens;
 
     public SessionTokenUsage Add(SessionTokenUsage other)
         => new(
             InputTokens + other.InputTokens,
-            CachedInputTokens + other.CachedInputTokens,
+            CacheCreation5MinuteInputTokens + other.CacheCreation5MinuteInputTokens,
+            CacheCreation1HourInputTokens + other.CacheCreation1HourInputTokens,
+            CacheReadInputTokens + other.CacheReadInputTokens,
             OutputTokens + other.OutputTokens,
             ReasoningOutputTokens + other.ReasoningOutputTokens,
             TotalTokens + other.TotalTokens);
 }
+
+public sealed record SessionTokenUsageRecord(
+    string Key,
+    string? Timestamp,
+    string Model,
+    SessionTokenUsage Usage);
+
+public sealed record AnthropicModelPrice(
+    string Model,
+    decimal InputPerMillionTokens,
+    decimal CacheWrite5MinutePerMillionTokens,
+    decimal CacheWrite1HourPerMillionTokens,
+    decimal CacheReadPerMillionTokens,
+    decimal OutputPerMillionTokens);
+
+public sealed record AnthropicPricing(
+    string SourceUrl,
+    string? RefreshedAt,
+    IReadOnlyList<AnthropicModelPrice> Models);
+
+public sealed record TokenUsageCostBreakdown(
+    decimal InputCost,
+    decimal CacheWriteCost,
+    decimal CacheReadCost,
+    decimal OutputCost,
+    decimal TotalCost,
+    int PricedRows,
+    int UnpricedRows,
+    string PricingSourceUrl,
+    string? PricingRefreshedAt);
+
+public sealed record TokenUsageDailyBreakdown(
+    DateOnly Date,
+    SessionTokenUsage TokenUsage,
+    decimal Cost);
+
+public sealed record TokenUsageModelBreakdown(
+    string Model,
+    SessionTokenUsage TokenUsage,
+    decimal Cost);
 
 public sealed record SessionDetailMetrics(
     int InteractionCount,
@@ -119,7 +166,10 @@ public sealed record TokenUsageSummaryResult(
     long FileSizeBytes,
     int OversizedLineCount,
     int TokenCountRows,
-    SessionTokenUsage TokenUsage);
+    SessionTokenUsage TokenUsage,
+    TokenUsageCostBreakdown? CostBreakdown,
+    IReadOnlyList<TokenUsageDailyBreakdown> DailyBreakdown,
+    IReadOnlyList<TokenUsageModelBreakdown> ModelBreakdown);
 
 public sealed record ExportJobStatus(
     string Kind,

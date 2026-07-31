@@ -1,4 +1,5 @@
-using System.Text.Json;
+﻿using System.Text.Json;
+using Clodlogs.Desktop.Models;
 
 namespace Clodlogs.Desktop.Services;
 
@@ -129,6 +130,10 @@ public sealed class AppSettingsService
                 {
                     settings.WindowFrame = legacy.WindowFrame;
                 }
+                if (settings.AnthropicPricing is null && legacy.AnthropicPricing is not null)
+                {
+                    settings.AnthropicPricing = legacy.AnthropicPricing;
+                }
             }
             catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
             {
@@ -182,6 +187,7 @@ public sealed class AppSettings
     public string? ExportDirectory { get; set; }
     public string? LastOpenedFolder { get; set; }
     public AppWindowFrame? WindowFrame { get; set; }
+    public AnthropicPricing? AnthropicPricing { get; set; }
     public bool LegacySettingsMigrated { get; set; }
 }
 

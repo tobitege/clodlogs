@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using System.Reflection;
 using Clodlogs.Desktop.Models;
 using Clodlogs.Desktop.Services;
@@ -18,7 +18,10 @@ var tests = new List<(string Name, Func<Task> Run)>
     ("settings persistence failure does not prevent startup", TestSettingsPersistenceFailureAsync),
     ("session scan returns partial results after cancellation", TestPartialSessionScanAsync),
     ("session probe preserves cancellation", TestSessionProbeCancellationAsync),
-    ("sanitized copy strips response item images", TestSanitizedCopyAsync)
+    ("sanitized copy strips response item images", TestSanitizedCopyAsync),
+    ("token usage separates cache and calculates costs", TestTokenUsagePricingAsync),
+    ("anthropic pricing parser maps cache read and output", TestAnthropicPricingParser),
+    ("token summary exports csv and markdown", TestTokenSummaryExports)
 };
 
 var failed = 0;
@@ -59,6 +62,97 @@ static async Task TestResponseItemTranscriptAsync()
     AssertEqual(SessionTranscriptEntryKind.ToolOutput, transcript.Entries[2].Kind, "function output kind");
     AssertEqual(SessionTranscriptEntryKind.CustomToolCall, transcript.Entries[3].Kind, "custom tool kind");
     AssertEqual(SessionTranscriptEntryKind.Reasoning, transcript.Entries[4].Kind, "reasoning kind");
+}
+
+static async Task TestTokenUsagePricingAsync()
+{
+    using var fixture = new TempFixture();
+    var sessionPath = fixture.WriteSession("""
+        {"type":"assistant","timestamp":"2026-07-14T10:15:00.000Z","uuid":"usage-row","message":{"id":"msg-usage","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":1000000,"cache_creation_input_tokens":2000000,"cache_creation":{"ephemeral_5m_input_tokens":1500000,"ephemeral_1h_input_tokens":500000},"cache_read_input_tokens":3000000,"output_tokens":4000000,"output_tokens_details":{"thinking_tokens":250000}}}}
+        """, "token-usage.jsonl");
+
+    var service = new ClaudeSessionService();
+    var usage = await service.ReadSessionTokenUsageAsync(sessionPath);
+
+    AssertTrue(usage.TokenUsage is not null, "session usage exists");
+    AssertEqual(1_000_000L, usage.TokenUsage!.InputTokens, "input tokens");
+    AssertEqual(2_000_000L, usage.TokenUsage.CacheCreationInputTokens, "cache write tokens");
+    AssertEqual(1_500_000L, usage.TokenUsage.CacheCreation5MinuteInputTokens, "5-minute cache write tokens");
+    AssertEqual(500_000L, usage.TokenUsage.CacheCreation1HourInputTokens, "1-hour cache write tokens");
+    AssertEqual(3_000_000L, usage.TokenUsage.CacheReadInputTokens, "cache read tokens");
+    AssertEqual(4_000_000L, usage.TokenUsage.OutputTokens, "output tokens");
+    AssertEqual(250_000L, usage.TokenUsage.ReasoningOutputTokens, "thinking tokens");
+    AssertEqual(10_000_000L, usage.TokenUsage.TotalTokens, "total tokens");
+
+    var job = service.StartTokenUsageSummaryJob([sessionPath], AnthropicPricingService.DefaultPricing());
+    var status = await WaitForTokenSummaryAsync(() => service.GetTokenUsageSummaryJobStatus(job.JobId));
+
+    AssertEqual("success", status.Kind, "token summary status");
+    AssertTrue(status.Result?.CostBreakdown is not null, "cost breakdown exists");
+    AssertEqual(72.525m, status.Result!.CostBreakdown!.TotalCost, "estimated cost");
+    AssertEqual(1, status.Result.DailyBreakdown.Count, "daily rows");
+    AssertEqual(1, status.Result.ModelBreakdown.Count, "model rows");
+}
+
+static Task TestAnthropicPricingParser()
+{
+    const string pricingDocument = """
+        | Model | Base Input Tokens | 5m Cache Writes | 1h Cache Writes | Cache Hits & Refreshes | Output Tokens |
+        | --- | --- | --- | --- | --- | --- |
+        | Claude Sonnet 4.5 | $3 / MTok | $3.75 / MTok | $6 / MTok | $0.30 / MTok | $15 / MTok |
+        """;
+
+    var pricing = AnthropicPricingService.ParsePricingDocument(pricingDocument);
+    AssertEqual(1, pricing.Models.Count, "parsed model count");
+    AssertEqual("Claude Sonnet 4.5", pricing.Models[0].Model, "parsed model name");
+    AssertEqual(3.75m, pricing.Models[0].CacheWrite5MinutePerMillionTokens, "5-minute cache write price");
+    AssertEqual(6m, pricing.Models[0].CacheWrite1HourPerMillionTokens, "1-hour cache write price");
+    AssertEqual(0.30m, pricing.Models[0].CacheReadPerMillionTokens, "cache read price");
+    AssertEqual(15m, pricing.Models[0].OutputPerMillionTokens, "output price");
+    AssertEqual<AnthropicModelPrice?>(null, AnthropicPricingService.FindPrice(pricing, "claude-3-5-sonnet-20241022"), "older model stays unpriced");
+    return Task.CompletedTask;
+}
+
+static Task TestTokenSummaryExports()
+{
+    var usage = new SessionTokenUsage(1000, 200, 300, 400, 500, 100, 2400);
+    var cost = new TokenUsageCostBreakdown(
+        0.003m,
+        0.004m,
+        0.00012m,
+        0.0075m,
+        0.01462m,
+        1,
+        0,
+        AnthropicPricingService.PricingSourceUrl,
+        "2026-07-31T10:00:00.0000000Z");
+    var summary = new TokenUsageSummaryResult(
+        1,
+        1,
+        1,
+        0,
+        0,
+        123,
+        0,
+        1,
+        usage,
+        cost,
+        [new TokenUsageDailyBreakdown(new DateOnly(2026, 7, 14), usage, cost.TotalCost)],
+        [new TokenUsageModelBreakdown("Claude Sonnet 4.5", usage, cost.TotalCost)]);
+    var service = new ClaudeSessionService();
+
+    var csv = service.FormatTokenUsageSummaryAsCsv(summary);
+    AssertContains("\"Section\",\"Date\",\"Model\"", csv, "csv header");
+    AssertContains("\"Daily\",\"2026-07-14\",\"\"", csv, "csv daily row");
+    AssertContains("\"Model\",\"\",\"Claude Sonnet 4.5\"", csv, "csv model row");
+    AssertContains("\"0.01462\"", csv, "csv invariant cost");
+
+    var markdown = service.FormatTokenUsageSummaryAsMarkdown(summary);
+    AssertContains("# Token usage summary", markdown, "markdown title");
+    AssertContains("| 2026-07-14 |", markdown, "markdown daily row");
+    AssertContains("| Claude Sonnet 4.5 |", markdown, "markdown model row");
+    AssertContains(AnthropicPricingService.PricingSourceUrl, markdown, "markdown pricing source");
+    return Task.CompletedTask;
 }
 
 static async Task TestMarkdownExportResponseItemsAndImagesAsync()
@@ -420,6 +514,22 @@ static async Task<BatchExportJobStatus> WaitForBatchExportAsync(Func<BatchExport
     }
 
     throw new TimeoutException("Timed out waiting for batch export completion.");
+}
+
+static async Task<TokenUsageSummaryJobStatus> WaitForTokenSummaryAsync(Func<TokenUsageSummaryJobStatus> readStatus)
+{
+    for (var attempt = 0; attempt < 200; attempt++)
+    {
+        var status = readStatus();
+        if (status.Kind != "working")
+        {
+            return status;
+        }
+
+        await Task.Delay(25);
+    }
+
+    throw new TimeoutException("Timed out waiting for token summary completion.");
 }
 
 static void AssertEqual<T>(T expected, T actual, string label)

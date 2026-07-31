@@ -1,4 +1,4 @@
-using System.Buffers;
+﻿using System.Buffers;
 using System.Diagnostics;
 using System.Globalization;
 using System.Security.Cryptography;
@@ -230,7 +230,7 @@ public sealed class ClaudeSessionService
 
         var interactions = 0;
         var toolCalls = 0;
-        var usageByMessage = new Dictionary<string, SessionTokenUsage>();
+        var usageByMessage = new Dictionary<string, SessionTokenUsageRecord>();
         long largestParsedLine = 0;
         var oversizedLineCount = 0;
 
@@ -276,6 +276,15 @@ public sealed class ClaudeSessionService
         IProgress<(long BytesProcessed, long FileSizeBytes)>? progress = null,
         CancellationToken cancellationToken = default)
     {
+        var result = await ReadSessionTokenUsageRecordsAsync(inputPath, progress, cancellationToken);
+        return (result.TokenUsage, result.FileSizeBytes, result.OversizedLineCount, result.TokenCountRows);
+    }
+
+    public async Task<(IReadOnlyList<SessionTokenUsageRecord> Records, SessionTokenUsage? TokenUsage, long FileSizeBytes, int OversizedLineCount, int TokenCountRows)> ReadSessionTokenUsageRecordsAsync(
+        string inputPath,
+        IProgress<(long BytesProcessed, long FileSizeBytes)>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
         var path = ResolveFilesystemPath(inputPath);
         if (!File.Exists(path))
         {
@@ -283,7 +292,7 @@ public sealed class ClaudeSessionService
         }
 
         var fileSize = new FileInfo(path).Length;
-        var usageByMessage = new Dictionary<string, SessionTokenUsage>();
+        var usageByMessage = new Dictionary<string, SessionTokenUsageRecord>();
         var oversizedLineCount = 0;
 
         await foreach (var evt in StreamJsonlRecordsAsync(path, MaxJsonlLineBytesHard, false, cancellationToken))
@@ -301,7 +310,7 @@ public sealed class ClaudeSessionService
         }
 
         progress?.Report((fileSize, fileSize));
-        return (SumClaudeTokenUsage(usageByMessage), fileSize, oversizedLineCount, usageByMessage.Count);
+        return (usageByMessage.Values.ToArray(), SumClaudeTokenUsage(usageByMessage), fileSize, oversizedLineCount, usageByMessage.Count);
     }
 
     public async Task<SessionTranscriptResult> ReadSessionTranscriptAsync(
@@ -639,8 +648,9 @@ public sealed class ClaudeSessionService
         }
     }
 
-    public JobStartResult StartTokenUsageSummaryJob(IReadOnlyList<string> sessionFilePaths)
+    public JobStartResult StartTokenUsageSummaryJob(IReadOnlyList<string> sessionFilePaths, AnthropicPricing? pricing = null)
     {
+        pricing ??= AnthropicPricingService.DefaultPricing();
         var distinctPaths = sessionFilePaths.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         var jobId = Guid.NewGuid().ToString("N");
         var record = new JobRecord<TokenUsageSummaryJobStatus>(
@@ -661,6 +671,7 @@ public sealed class ClaudeSessionService
             long fileSizeBytes = 0;
             var oversizedLineCount = 0;
             var tokenRows = 0;
+            var usageRecords = new List<SessionTokenUsageRecord>();
 
             try
             {
@@ -693,12 +704,13 @@ public sealed class ClaudeSessionService
                                 path,
                                 null));
                         });
-                        var result = await ReadSessionTokenUsageAsync(path, progressReporter, record.Cancellation.Token);
+                        var result = await ReadSessionTokenUsageRecordsAsync(path, progressReporter, record.Cancellation.Token);
 
                         scanned++;
                         fileSizeBytes += result.FileSizeBytes;
                         oversizedLineCount += result.OversizedLineCount;
                         tokenRows += result.TokenCountRows;
+                        usageRecords.AddRange(result.Records);
                         if (result.TokenUsage is not null)
                         {
                             totalUsage = totalUsage.Add(result.TokenUsage);
@@ -726,7 +738,10 @@ public sealed class ClaudeSessionService
                     fileSizeBytes,
                     oversizedLineCount,
                     tokenRows,
-                    totalUsage);
+                    totalUsage,
+                    BuildTokenUsageCostBreakdown(usageRecords, pricing),
+                    BuildTokenUsageDailyBreakdown(usageRecords, pricing),
+                    BuildTokenUsageModelBreakdown(usageRecords, pricing));
                 SetTokenSummaryStatus(jobId, new TokenUsageSummaryJobStatus(
                     "success",
                     100,
@@ -856,14 +871,16 @@ public sealed class ClaudeSessionService
             $"Session: {sessionTitle}",
             $"Total tokens: {usage.TotalTokens}",
             $"Input tokens: {usage.InputTokens}",
-            $"Cached input tokens: {usage.CachedInputTokens}",
-            $"Uncached input tokens: {Math.Max(0, usage.InputTokens - usage.CachedInputTokens)}",
+            $"Cache write tokens: {usage.CacheCreationInputTokens}",
+            $"Cache read tokens: {usage.CacheReadInputTokens}",
             $"Output tokens: {usage.OutputTokens}",
             $"Reasoning output tokens: {usage.ReasoningOutputTokens}"
         ]);
 
     public string FormatTokenUsageSummaryForClipboard(TokenUsageSummaryResult summary)
-        => string.Join(Environment.NewLine, [
+    {
+        var lines = new List<string>
+        {
             "Filtered sessions token summary",
             $"Sessions: {summary.SessionCount}",
             $"Scanned sessions: {summary.ScannedSessionCount}",
@@ -875,11 +892,130 @@ public sealed class ClaudeSessionService
             "",
             $"Total tokens: {summary.TokenUsage.TotalTokens}",
             $"Input tokens: {summary.TokenUsage.InputTokens}",
-            $"Cached input tokens: {summary.TokenUsage.CachedInputTokens}",
-            $"Uncached input tokens: {Math.Max(0, summary.TokenUsage.InputTokens - summary.TokenUsage.CachedInputTokens)}",
+            $"Cache write tokens: {summary.TokenUsage.CacheCreationInputTokens}",
+            $"Cache read tokens: {summary.TokenUsage.CacheReadInputTokens}",
             $"Output tokens: {summary.TokenUsage.OutputTokens}",
             $"Reasoning output tokens: {summary.TokenUsage.ReasoningOutputTokens}"
-        ]);
+        };
+        if (summary.CostBreakdown is not null)
+        {
+            lines.Add("");
+            lines.Add($"Estimated cost (USD): {summary.CostBreakdown.TotalCost:F2}");
+            lines.Add($"Priced usage rows: {summary.CostBreakdown.PricedRows}");
+            lines.Add($"Unpriced usage rows: {summary.CostBreakdown.UnpricedRows}");
+        }
+
+        return string.Join(Environment.NewLine, lines);
+    }
+
+    public string FormatTokenUsageSummaryAsCsv(TokenUsageSummaryResult summary)
+    {
+        var csv = new StringBuilder();
+        AppendCsvRow(csv,
+            "Section",
+            "Date",
+            "Model",
+            "InputTokens",
+            "CacheWrite5MinuteTokens",
+            "CacheWrite1HourTokens",
+            "CacheReadTokens",
+            "OutputTokens",
+            "TotalTokens",
+            "EstimatedCostUsd");
+        AppendTokenUsageCsvRow(
+            csv,
+            "Summary",
+            "",
+            "All models",
+            summary.TokenUsage,
+            summary.CostBreakdown?.TotalCost);
+        foreach (var day in summary.DailyBreakdown)
+        {
+            AppendTokenUsageCsvRow(csv, "Daily", day.Date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture), "", day.TokenUsage, day.Cost);
+        }
+        foreach (var model in summary.ModelBreakdown)
+        {
+            AppendTokenUsageCsvRow(csv, "Model", "", model.Model, model.TokenUsage, model.Cost);
+        }
+
+        return csv.ToString();
+    }
+
+    public string FormatTokenUsageSummaryAsMarkdown(TokenUsageSummaryResult summary)
+    {
+        var markdown = new StringBuilder();
+        markdown.AppendLine("# Token usage summary");
+        markdown.AppendLine();
+        markdown.AppendLine($"- Sessions: {summary.SessionCount.ToString(CultureInfo.InvariantCulture)}");
+        markdown.AppendLine($"- Sessions with token usage: {summary.SessionsWithTokenUsage.ToString(CultureInfo.InvariantCulture)}");
+        markdown.AppendLine($"- Failed sessions: {summary.FailedSessionCount.ToString(CultureInfo.InvariantCulture)}");
+        if (summary.CostBreakdown is not null)
+        {
+            markdown.AppendLine($"- Estimated cost: ${summary.CostBreakdown.TotalCost.ToString("0.00######", CultureInfo.InvariantCulture)} USD");
+            markdown.AppendLine($"- Pricing source: {summary.CostBreakdown.PricingSourceUrl}");
+        }
+
+        markdown.AppendLine();
+        markdown.AppendLine("## Totals");
+        markdown.AppendLine();
+        markdown.AppendLine("| Input | Cache write (5 min) | Cache write (1 h) | Cache read | Output | Total |");
+        markdown.AppendLine("| ---: | ---: | ---: | ---: | ---: | ---: |");
+        markdown.AppendLine($"| {FormatInvariant(summary.TokenUsage.InputTokens)} | {FormatInvariant(summary.TokenUsage.CacheCreation5MinuteInputTokens)} | {FormatInvariant(summary.TokenUsage.CacheCreation1HourInputTokens)} | {FormatInvariant(summary.TokenUsage.CacheReadInputTokens)} | {FormatInvariant(summary.TokenUsage.OutputTokens)} | {FormatInvariant(summary.TokenUsage.TotalTokens)} |");
+
+        markdown.AppendLine();
+        markdown.AppendLine("## Daily usage");
+        markdown.AppendLine();
+        markdown.AppendLine("| Date | Input | Cache write | Cache read | Output | Total | Cost (USD) |");
+        markdown.AppendLine("| --- | ---: | ---: | ---: | ---: | ---: | ---: |");
+        foreach (var day in summary.DailyBreakdown)
+        {
+            markdown.AppendLine($"| {day.Date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)} | {FormatInvariant(day.TokenUsage.InputTokens)} | {FormatInvariant(day.TokenUsage.CacheCreationInputTokens)} | {FormatInvariant(day.TokenUsage.CacheReadInputTokens)} | {FormatInvariant(day.TokenUsage.OutputTokens)} | {FormatInvariant(day.TokenUsage.TotalTokens)} | {day.Cost.ToString("0.00######", CultureInfo.InvariantCulture)} |");
+        }
+
+        markdown.AppendLine();
+        markdown.AppendLine("## Models");
+        markdown.AppendLine();
+        markdown.AppendLine("| Model | Input | Cache write | Cache read | Output | Total | Cost (USD) |");
+        markdown.AppendLine("| --- | ---: | ---: | ---: | ---: | ---: | ---: |");
+        foreach (var model in summary.ModelBreakdown)
+        {
+            markdown.AppendLine($"| {EscapeMarkdownCell(model.Model)} | {FormatInvariant(model.TokenUsage.InputTokens)} | {FormatInvariant(model.TokenUsage.CacheCreationInputTokens)} | {FormatInvariant(model.TokenUsage.CacheReadInputTokens)} | {FormatInvariant(model.TokenUsage.OutputTokens)} | {FormatInvariant(model.TokenUsage.TotalTokens)} | {model.Cost.ToString("0.00######", CultureInfo.InvariantCulture)} |");
+        }
+
+        return markdown.ToString();
+    }
+
+    private static void AppendTokenUsageCsvRow(
+        StringBuilder csv,
+        string section,
+        string date,
+        string model,
+        SessionTokenUsage usage,
+        decimal? cost)
+        => AppendCsvRow(
+            csv,
+            section,
+            date,
+            model,
+            FormatInvariant(usage.InputTokens),
+            FormatInvariant(usage.CacheCreation5MinuteInputTokens),
+            FormatInvariant(usage.CacheCreation1HourInputTokens),
+            FormatInvariant(usage.CacheReadInputTokens),
+            FormatInvariant(usage.OutputTokens),
+            FormatInvariant(usage.TotalTokens),
+            cost?.ToString("0.00######", CultureInfo.InvariantCulture) ?? "");
+
+    private static void AppendCsvRow(StringBuilder csv, params string[] values)
+        => csv.AppendLine(string.Join(',', values.Select(EscapeCsvField)));
+
+    private static string EscapeCsvField(string value)
+        => $"\"{value.Replace("\"", "\"\"", StringComparison.Ordinal)}\"";
+
+    private static string EscapeMarkdownCell(string value)
+        => value.Replace("|", "\\|", StringComparison.Ordinal);
+
+    private static string FormatInvariant(long value)
+        => value.ToString(CultureInfo.InvariantCulture);
 
     public static string ResolveFilesystemPath(string inputPath)
     {
@@ -1741,16 +1877,16 @@ public sealed class ClaudeSessionService
         return content?.Count(item => (item as JsonObject)?["type"]?.GetValue<string>() == "tool_use") ?? 0;
     }
 
-    private static void AddClaudeUsageFromRecord(JsonObject record, Dictionary<string, SessionTokenUsage> target)
+    private static void AddClaudeUsageFromRecord(JsonObject record, Dictionary<string, SessionTokenUsageRecord> target)
     {
         var usage = ExtractClaudeUsage(record);
         if (usage is not null)
         {
-            target[usage.Value.Key] = usage.Value.Usage;
+            target[usage.Key] = usage;
         }
     }
 
-    private static (string Key, SessionTokenUsage Usage)? ExtractClaudeUsage(JsonObject record)
+    private static SessionTokenUsageRecord? ExtractClaudeUsage(JsonObject record)
     {
         var message = record["message"] as JsonObject;
         var usage = message?["usage"] as JsonObject;
@@ -1761,9 +1897,21 @@ public sealed class ClaudeSessionService
 
         var input = GetNonNegativeLong(usage, "input_tokens") ?? 0;
         var cacheCreation = GetNonNegativeLong(usage, "cache_creation_input_tokens") ?? 0;
+        var cacheCreationDetails = usage["cache_creation"] as JsonObject;
+        var cacheCreation5Minute = cacheCreationDetails is null ? 0
+            : GetNonNegativeLong(cacheCreationDetails, "ephemeral_5m_input_tokens") ?? 0;
+        var cacheCreation1Hour = cacheCreationDetails is null ? 0
+            : GetNonNegativeLong(cacheCreationDetails, "ephemeral_1h_input_tokens") ?? 0;
+        cacheCreation = Math.Max(cacheCreation, cacheCreation5Minute + cacheCreation1Hour);
+        var unclassifiedCacheCreation = Math.Max(0, cacheCreation - cacheCreation5Minute - cacheCreation1Hour);
+        cacheCreation5Minute += unclassifiedCacheCreation;
         var cacheRead = GetNonNegativeLong(usage, "cache_read_input_tokens") ?? 0;
         var output = GetNonNegativeLong(usage, "output_tokens") ?? 0;
-        if (input == 0 && cacheCreation == 0 && cacheRead == 0 && output == 0)
+        var outputDetails = usage["output_tokens_details"] as JsonObject;
+        var reasoningOutput = (outputDetails is null ? null : GetNonNegativeLong(outputDetails, "thinking_tokens"))
+            ?? GetNonNegativeLong(usage, "reasoning_output_tokens")
+            ?? 0;
+        if (input == 0 && cacheCreation == 0 && cacheRead == 0 && output == 0 && reasoningOutput == 0)
         {
             return null;
         }
@@ -1771,14 +1919,28 @@ public sealed class ClaudeSessionService
         var key = GetString(message, "id") ?? GetString(record, "requestId") ?? GetString(record, "uuid");
         if (string.IsNullOrWhiteSpace(key))
         {
-            return null;
+            key = string.Join(":", [
+                GetString(record, "timestamp") ?? "",
+                GetString(message, "model") ?? "unknown",
+                input.ToString(CultureInfo.InvariantCulture),
+                cacheCreation5Minute.ToString(CultureInfo.InvariantCulture),
+                cacheCreation1Hour.ToString(CultureInfo.InvariantCulture),
+                cacheRead.ToString(CultureInfo.InvariantCulture),
+                output.ToString(CultureInfo.InvariantCulture)
+            ]);
         }
 
-        var totalInput = input + cacheCreation + cacheRead;
-        return (key, new SessionTokenUsage(totalInput, cacheCreation + cacheRead, output, 0, totalInput + output));
+        var model = GetString(message, "model") ?? GetString(record, "model") ?? "Unknown model";
+        var timestamp = GetString(record, "timestamp") ?? GetString(message, "timestamp");
+        var total = input + cacheCreation + cacheRead + output;
+        return new SessionTokenUsageRecord(
+            key,
+            timestamp,
+            model,
+            new SessionTokenUsage(input, cacheCreation5Minute, cacheCreation1Hour, cacheRead, output, reasoningOutput, total));
     }
 
-    private static SessionTokenUsage? SumClaudeTokenUsage(Dictionary<string, SessionTokenUsage> usageByMessage)
+    private static SessionTokenUsage? SumClaudeTokenUsage(Dictionary<string, SessionTokenUsageRecord> usageByMessage)
     {
         if (usageByMessage.Count == 0)
         {
@@ -1786,12 +1948,122 @@ public sealed class ClaudeSessionService
         }
 
         var total = SessionTokenUsage.Empty;
-        foreach (var usage in usageByMessage.Values)
+        foreach (var record in usageByMessage.Values)
         {
-            total = total.Add(usage);
+            total = total.Add(record.Usage);
         }
 
         return total;
+    }
+
+    private static TokenUsageCostBreakdown BuildTokenUsageCostBreakdown(
+        IReadOnlyList<SessionTokenUsageRecord> records,
+        AnthropicPricing pricing)
+    {
+        decimal inputCost = 0;
+        decimal cacheWriteCost = 0;
+        decimal cacheReadCost = 0;
+        decimal outputCost = 0;
+        var pricedRows = 0;
+        var unpricedRows = 0;
+        const decimal oneMillion = 1_000_000m;
+
+        foreach (var record in records)
+        {
+            var price = AnthropicPricingService.FindPrice(pricing, record.Model);
+            if (price is null)
+            {
+                unpricedRows++;
+                continue;
+            }
+
+            inputCost += record.Usage.InputTokens / oneMillion * price.InputPerMillionTokens;
+            cacheWriteCost += record.Usage.CacheCreation5MinuteInputTokens / oneMillion * price.CacheWrite5MinutePerMillionTokens;
+            cacheWriteCost += record.Usage.CacheCreation1HourInputTokens / oneMillion * price.CacheWrite1HourPerMillionTokens;
+            cacheReadCost += record.Usage.CacheReadInputTokens / oneMillion * price.CacheReadPerMillionTokens;
+            outputCost += record.Usage.OutputTokens / oneMillion * price.OutputPerMillionTokens;
+            pricedRows++;
+        }
+
+        return new TokenUsageCostBreakdown(
+            inputCost,
+            cacheWriteCost,
+            cacheReadCost,
+            outputCost,
+            inputCost + cacheWriteCost + cacheReadCost + outputCost,
+            pricedRows,
+            unpricedRows,
+            pricing.SourceUrl,
+            pricing.RefreshedAt);
+    }
+
+    private static IReadOnlyList<TokenUsageDailyBreakdown> BuildTokenUsageDailyBreakdown(
+        IReadOnlyList<SessionTokenUsageRecord> records,
+        AnthropicPricing pricing)
+    {
+        var daily = new Dictionary<DateOnly, (SessionTokenUsage Usage, decimal Cost)>();
+        foreach (var record in records)
+        {
+            if (!TryGetLocalUsageDate(record.Timestamp, out var date))
+            {
+                continue;
+            }
+
+            if (!daily.TryGetValue(date, out var current))
+            {
+                current = (SessionTokenUsage.Empty, 0m);
+            }
+            var cost = CalculateRecordCost(record, pricing);
+            daily[date] = (current.Usage.Add(record.Usage), current.Cost + cost);
+        }
+
+        return daily
+            .OrderBy(item => item.Key)
+            .Select(item => new TokenUsageDailyBreakdown(item.Key, item.Value.Usage, item.Value.Cost))
+            .ToArray();
+    }
+
+    private static IReadOnlyList<TokenUsageModelBreakdown> BuildTokenUsageModelBreakdown(
+        IReadOnlyList<SessionTokenUsageRecord> records,
+        AnthropicPricing pricing)
+    {
+        var models = new Dictionary<string, (SessionTokenUsage Usage, decimal Cost)>(StringComparer.OrdinalIgnoreCase);
+        foreach (var record in records)
+        {
+            if (!models.TryGetValue(record.Model, out var current))
+            {
+                current = (SessionTokenUsage.Empty, 0m);
+            }
+            models[record.Model] = (current.Usage.Add(record.Usage), current.Cost + CalculateRecordCost(record, pricing));
+        }
+
+        return models
+            .OrderByDescending(item => item.Value.Cost)
+            .ThenBy(item => item.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(item => new TokenUsageModelBreakdown(item.Key, item.Value.Usage, item.Value.Cost))
+            .ToArray();
+    }
+
+    private static decimal CalculateRecordCost(SessionTokenUsageRecord record, AnthropicPricing pricing)
+    {
+        var price = AnthropicPricingService.FindPrice(pricing, record.Model);
+        return price is null ? 0m : AnthropicPricingService.CalculateCost(record.Usage, price);
+    }
+
+    private static bool TryGetLocalUsageDate(string? timestamp, out DateOnly date)
+    {
+        if (DateTimeOffset.TryParse(
+            timestamp,
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeUniversal,
+            out var parsed))
+        {
+            date = DateOnly.FromDateTime(parsed.LocalDateTime);
+            return true;
+        }
+
+        date = default;
+        return false;
     }
 
     private async Task<bool> SessionTouchesRootAsync(string file, List<ComparablePathAlias> rootAliases, string? sessionCwd, CancellationToken cancellationToken)

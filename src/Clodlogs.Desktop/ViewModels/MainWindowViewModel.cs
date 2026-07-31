@@ -1,5 +1,6 @@
-using System.Collections.ObjectModel;
+﻿using System.Collections.ObjectModel;
 using System.Diagnostics;
+using System.Globalization;
 using Avalonia.Threading;
 using Clodlogs.Desktop.Models;
 using Clodlogs.Desktop.Services;
@@ -48,6 +49,7 @@ public sealed class MainWindowViewModel : ViewModelBase
     private bool _sanitizeProgressVisible;
     private bool _transcriptDialogVisible;
     private bool _tokenSummaryDialogVisible;
+    private bool _optionsDialogVisible;
     private string _exportFormat = "markdown";
     private bool _exportImages;
     private bool _exportInlineImages = true;
@@ -72,6 +74,9 @@ public sealed class MainWindowViewModel : ViewModelBase
     private bool _transcriptShowToolCalls = true;
     private SessionTranscriptResult? _transcript;
     private TokenUsageSummaryJobStatus? _tokenSummaryStatus;
+    private AnthropicPricing _anthropicPricing = AnthropicPricingService.DefaultPricing();
+    private bool _isPricingRefreshing;
+    private string _pricingStatus = "Bundled Anthropic prices are active.";
 
     public MainWindowViewModel(ClaudeSessionService sessions, IUiService ui, AppSettingsService settings)
     {
@@ -105,6 +110,9 @@ public sealed class MainWindowViewModel : ViewModelBase
         CancelTokenSummaryCommand = new RelayCommand(CancelTokenSummary);
         CopySelectedTokenUsageCommand = new AsyncRelayCommand(CopySelectedTokenUsageAsync, () => SelectedMetrics?.TokenUsage is not null && SelectedSession is not null);
         CopyTokenSummaryCommand = new AsyncRelayCommand(CopyTokenSummaryAsync, () => TokenSummaryStatus?.Result is not null);
+        ExportTokenSummaryCommand = new AsyncRelayCommand(ExportTokenSummaryAsync, _ => TokenSummaryStatus?.Result is not null);
+        OpenOptionsCommand = new RelayCommand(() => OptionsDialogVisible = true);
+        RefreshPricingCommand = new AsyncRelayCommand(RefreshPricingAsync);
         RevealOperationOutputCommand = new AsyncRelayCommand(RevealOperationOutputAsync, () => !string.IsNullOrWhiteSpace(OperationOutputPath));
         OpenSelectedFileCommand = new AsyncRelayCommand(() => SelectedSession is null ? Task.CompletedTask : _ui.OpenPathAsync(SelectedSession.File), () => SelectedSession is not null);
         RevealSelectedFileCommand = new AsyncRelayCommand(() => SelectedSession is null ? Task.CompletedTask : _ui.RevealPathAsync(SelectedSession.File), () => SelectedSession is not null);
@@ -118,6 +126,9 @@ public sealed class MainWindowViewModel : ViewModelBase
     public ObservableCollection<SessionCardViewModel> FilteredSessions { get; } = [];
     public ObservableCollection<BatchExportSessionViewModel> BatchExportSessions { get; } = [];
     public ObservableCollection<TranscriptEntryViewModel> TranscriptEntries { get; } = [];
+    public ObservableCollection<TokenUsageDailyBarViewModel> TokenSummaryDailyBars { get; } = [];
+    public ObservableCollection<TokenUsageModelRowViewModel> TokenSummaryModelRows { get; } = [];
+    public ObservableCollection<AnthropicPricingRowViewModel> AnthropicPricingRows { get; } = [];
     public string[] ExportFormats { get; } = ["markdown", "html"];
 
     public AsyncRelayCommand RefreshCommand { get; }
@@ -144,6 +155,9 @@ public sealed class MainWindowViewModel : ViewModelBase
     public RelayCommand CancelTokenSummaryCommand { get; }
     public AsyncRelayCommand CopySelectedTokenUsageCommand { get; }
     public AsyncRelayCommand CopyTokenSummaryCommand { get; }
+    public AsyncRelayCommand ExportTokenSummaryCommand { get; }
+    public RelayCommand OpenOptionsCommand { get; }
+    public AsyncRelayCommand RefreshPricingCommand { get; }
     public AsyncRelayCommand RevealOperationOutputCommand { get; }
     public AsyncRelayCommand OpenSelectedFileCommand { get; }
     public AsyncRelayCommand RevealSelectedFileCommand { get; }
@@ -364,7 +378,7 @@ public sealed class MainWindowViewModel : ViewModelBase
     public string TokenSummaryText
         => SelectedMetrics?.TokenUsage is null
             ? "No token usage found"
-            : $"{SelectedMetrics.TokenUsage.TotalTokens:n0} total / {SelectedMetrics.TokenUsage.InputTokens:n0} input / {SelectedMetrics.TokenUsage.OutputTokens:n0} output";
+            : $"{SelectedMetrics.TokenUsage.TotalTokens:n0} total / {SelectedMetrics.TokenUsage.InputTokens:n0} input / {SelectedMetrics.TokenUsage.OutputTokens:n0} output / {SelectedMetrics.TokenUsage.CacheCreationInputTokens:n0} cache write / {SelectedMetrics.TokenUsage.CacheReadInputTokens:n0} cache read";
 
     public bool HasAnalysisBanner => !string.IsNullOrWhiteSpace(AnalysisBannerText);
     public string? AnalysisBannerText => SelectedMetrics?.SkipReason;
@@ -436,6 +450,33 @@ public sealed class MainWindowViewModel : ViewModelBase
         get => _tokenSummaryDialogVisible;
         set => SetProperty(ref _tokenSummaryDialogVisible, value);
     }
+
+    public bool OptionsDialogVisible
+    {
+        get => _optionsDialogVisible;
+        set => SetProperty(ref _optionsDialogVisible, value);
+    }
+
+    public bool IsPricingRefreshing
+    {
+        get => _isPricingRefreshing;
+        private set
+        {
+            if (SetProperty(ref _isPricingRefreshing, value))
+            {
+                OnPropertyChanged(nameof(PricingRefreshButtonText));
+            }
+        }
+    }
+
+    public string PricingStatus
+    {
+        get => _pricingStatus;
+        private set => SetProperty(ref _pricingStatus, value);
+    }
+
+    public string PricingRefreshButtonText => IsPricingRefreshing ? "Refreshing..." : "Refresh";
+    public string PricingSourceUrl => _anthropicPricing.SourceUrl;
 
 
     public string ExportFormat
@@ -602,7 +643,18 @@ public sealed class MainWindowViewModel : ViewModelBase
                 OnPropertyChanged(nameof(TokenSummaryResultText));
                 OnPropertyChanged(nameof(IsTokenSummaryRunning));
                 OnPropertyChanged(nameof(CanCloseTokenSummary));
+                OnPropertyChanged(nameof(HasTokenSummaryResult));
+                OnPropertyChanged(nameof(TokenSummaryPeriodTitle));
+                OnPropertyChanged(nameof(TokenSummaryTotalCostText));
+                OnPropertyChanged(nameof(TokenSummaryInputText));
+                OnPropertyChanged(nameof(TokenSummaryOutputText));
+                OnPropertyChanged(nameof(TokenSummaryCacheWriteText));
+                OnPropertyChanged(nameof(TokenSummaryCacheReadText));
+                OnPropertyChanged(nameof(TokenSummaryGrandTotalText));
+                OnPropertyChanged(nameof(TokenSummaryPricingNote));
+                RefreshTokenSummaryBreakdowns(value?.Result);
                 CopyTokenSummaryCommand.RaiseCanExecuteChanged();
+                ExportTokenSummaryCommand.RaiseCanExecuteChanged();
             }
         }
     }
@@ -620,6 +672,49 @@ public sealed class MainWindowViewModel : ViewModelBase
     public int TokenSummaryProgress => TokenSummaryStatus?.ProgressPercent ?? 0;
     public bool IsTokenSummaryRunning => TokenSummaryStatus?.Kind == "working";
     public bool CanCloseTokenSummary => !IsTokenSummaryRunning;
+    public bool HasTokenSummaryResult => TokenSummaryStatus?.Result is not null;
+    public string TokenSummaryPeriodTitle
+    {
+        get
+        {
+            var days = TokenSummaryStatus?.Result?.DailyBreakdown;
+            if (days is null || days.Count == 0)
+            {
+                return "Token usage";
+            }
+
+            var first = days[0].Date;
+            var last = days[^1].Date;
+            if (first.Year == last.Year && first.Month == last.Month)
+            {
+                return first.ToString("MMMM yyyy", CultureInfo.CurrentCulture);
+            }
+
+            return $"{first.ToString("MMM yyyy", CultureInfo.CurrentCulture)} - {last.ToString("MMM yyyy", CultureInfo.CurrentCulture)}";
+        }
+    }
+
+    public string TokenSummaryTotalCostText => FormatUsd(TokenSummaryStatus?.Result?.CostBreakdown?.TotalCost ?? 0m);
+    public string TokenSummaryInputText => FormatCompactTokens(TokenSummaryStatus?.Result?.TokenUsage.InputTokens ?? 0);
+    public string TokenSummaryOutputText => FormatCompactTokens(TokenSummaryStatus?.Result?.TokenUsage.OutputTokens ?? 0);
+    public string TokenSummaryCacheWriteText => FormatCompactTokens(TokenSummaryStatus?.Result?.TokenUsage.CacheCreationInputTokens ?? 0);
+    public string TokenSummaryCacheReadText => FormatCompactTokens(TokenSummaryStatus?.Result?.TokenUsage.CacheReadInputTokens ?? 0);
+    public string TokenSummaryGrandTotalText => FormatCompactTokens(TokenSummaryStatus?.Result?.TokenUsage.TotalTokens ?? 0);
+    public string TokenSummaryPricingNote
+    {
+        get
+        {
+            var costs = TokenSummaryStatus?.Result?.CostBreakdown;
+            if (costs is null)
+            {
+                return "";
+            }
+
+            return costs.UnpricedRows == 0
+                ? $"Estimated from {costs.PricedRows:n0} priced usage rows."
+                : $"Estimated from {costs.PricedRows:n0} priced usage rows; {costs.UnpricedRows:n0} rows use an unknown model.";
+        }
+    }
     public string TokenSummaryResultText
     {
         get
@@ -641,6 +736,10 @@ public sealed class MainWindowViewModel : ViewModelBase
             StartupLoadingMessage = "Loading saved settings...";
             var appSettings = await _settings.ReadAsync();
             FolderPath = appSettings.LastOpenedFolder ?? System.Environment.CurrentDirectory;
+            _anthropicPricing = appSettings.AnthropicPricing ?? AnthropicPricingService.DefaultPricing();
+            RefreshAnthropicPricingRows();
+            PricingStatus = FormatPricingStatus(_anthropicPricing);
+            OnPropertyChanged(nameof(PricingSourceUrl));
             StartupLoadingMessage = "Checking the Claude environment...";
             await RefreshEnvironmentAsync();
             StartupLoadingMessage = "Scanning the session folder. Large histories can take a while...";
@@ -1234,7 +1333,7 @@ public sealed class MainWindowViewModel : ViewModelBase
     {
         TokenSummaryDialogVisible = true;
         TokenSummaryStatus = new TokenUsageSummaryJobStatus("working", 1, "starting", "Preparing token summary...", 0, FilteredSessions.Count, null, null);
-        _activeTokenSummaryJobId = _sessions.StartTokenUsageSummaryJob(FilteredSessions.Select(s => s.File).ToArray()).JobId;
+        _activeTokenSummaryJobId = _sessions.StartTokenUsageSummaryJob(FilteredSessions.Select(s => s.File).ToArray(), _anthropicPricing).JobId;
         while (true)
         {
             var status = _sessions.GetTokenUsageSummaryJobStatus(_activeTokenSummaryJobId);
@@ -1277,6 +1376,134 @@ public sealed class MainWindowViewModel : ViewModelBase
         await _ui.CopyTextAsync(_sessions.FormatTokenUsageSummaryForClipboard(TokenSummaryStatus.Result));
         StatusMessage = "Token summary copied.";
     }
+
+    private async Task ExportTokenSummaryAsync(object? parameter)
+    {
+        var summary = TokenSummaryStatus?.Result;
+        if (summary is null || parameter is not string format)
+        {
+            return;
+        }
+
+        var baseName = BuildTokenSummaryExportBaseName(summary);
+        try
+        {
+            var outputPath = format switch
+            {
+                "png" => await _ui.SaveStatisticsImageAsync($"{baseName}.png"),
+                "csv" => await _ui.SaveStatisticsTextAsync($"{baseName}.csv", "csv", _sessions.FormatTokenUsageSummaryAsCsv(summary)),
+                "md" => await _ui.SaveStatisticsTextAsync($"{baseName}.md", "md", _sessions.FormatTokenUsageSummaryAsMarkdown(summary)),
+                _ => throw new ArgumentOutOfRangeException(nameof(parameter), parameter, "Unsupported token statistics export format.")
+            };
+            if (!string.IsNullOrWhiteSpace(outputPath))
+            {
+                StatusMessage = $"Token statistics exported: {outputPath}";
+            }
+        }
+        catch (Exception ex)
+        {
+            ErrorMessage = ex.Message;
+        }
+    }
+
+    private static string BuildTokenSummaryExportBaseName(TokenUsageSummaryResult summary)
+    {
+        if (summary.DailyBreakdown.Count == 0)
+        {
+            return $"clodlogs-token-statistics-{DateTime.Today:yyyy-MM-dd}";
+        }
+
+        var first = summary.DailyBreakdown[0].Date;
+        var last = summary.DailyBreakdown[^1].Date;
+        var period = first == last
+            ? first.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
+            : $"{first.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)}_to_{last.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)}";
+        return $"clodlogs-token-statistics-{period}";
+    }
+
+    private async Task RefreshPricingAsync()
+    {
+        IsPricingRefreshing = true;
+        PricingStatus = "Refreshing prices from Anthropic...";
+        try
+        {
+            var refreshed = await new AnthropicPricingService().RefreshAsync();
+            _anthropicPricing = refreshed;
+            await _settings.UpdateAsync(settings => settings.AnthropicPricing = refreshed);
+            RefreshAnthropicPricingRows();
+            PricingStatus = FormatPricingStatus(refreshed);
+            OnPropertyChanged(nameof(PricingSourceUrl));
+        }
+        catch (Exception ex)
+        {
+            PricingStatus = $"Refresh failed: {ex.Message}";
+        }
+        finally
+        {
+            IsPricingRefreshing = false;
+        }
+    }
+
+    private void RefreshAnthropicPricingRows()
+    {
+        AnthropicPricingRows.Clear();
+        foreach (var price in _anthropicPricing.Models)
+        {
+            AnthropicPricingRows.Add(new AnthropicPricingRowViewModel(price));
+        }
+    }
+
+    private void RefreshTokenSummaryBreakdowns(TokenUsageSummaryResult? result)
+    {
+        TokenSummaryDailyBars.Clear();
+        TokenSummaryModelRows.Clear();
+        if (result is null)
+        {
+            return;
+        }
+
+        var maxTokens = Math.Max(1L, result.DailyBreakdown.Select(day => day.TokenUsage.TotalTokens).DefaultIfEmpty(0).Max());
+        foreach (var day in result.DailyBreakdown)
+        {
+            TokenSummaryDailyBars.Add(new TokenUsageDailyBarViewModel(day, maxTokens));
+        }
+
+        foreach (var model in result.ModelBreakdown)
+        {
+            TokenSummaryModelRows.Add(new TokenUsageModelRowViewModel(model));
+        }
+    }
+
+    private static string FormatPricingStatus(AnthropicPricing pricing)
+    {
+        if (DateTimeOffset.TryParse(pricing.RefreshedAt, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var refreshed))
+        {
+            return $"Last refreshed {refreshed.ToLocalTime():g}. Prices are USD per million tokens.";
+        }
+
+        return "Bundled Anthropic prices are active. Prices are USD per million tokens.";
+    }
+
+    private static string FormatCompactTokens(long value)
+    {
+        if (value >= 1_000_000_000)
+        {
+            return $"{value / 1_000_000_000d:0.##}B";
+        }
+        if (value >= 1_000_000)
+        {
+            return $"{value / 1_000_000d:0.##}M";
+        }
+        if (value >= 1_000)
+        {
+            return $"{value / 1_000d:0.##}K";
+        }
+
+        return value.ToString("n0", CultureInfo.CurrentCulture);
+    }
+
+    private static string FormatUsd(decimal value)
+        => $"${value:0.00}";
 
     private async Task RevealOperationOutputAsync()
     {
@@ -1338,6 +1565,7 @@ public sealed class MainWindowViewModel : ViewModelBase
         }
         SanitizeDialogVisible = false;
         TokenSummaryDialogVisible = false;
+        OptionsDialogVisible = false;
     }
 
     private void RefreshHeaderProperties()
@@ -1420,4 +1648,39 @@ public sealed class TranscriptEntryViewModel(SessionTranscriptEntry entry)
     public string Text => Entry.Text;
     public string TimestampLabel => DateTimeOffset.TryParse(Entry.Timestamp, out var parsed) ? parsed.ToLocalTime().ToString("g") : Entry.Timestamp ?? "unknown time";
     public string KindClass => Entry.Kind.ToString();
+}
+
+public sealed class TokenUsageDailyBarViewModel
+{
+    public TokenUsageDailyBarViewModel(TokenUsageDailyBreakdown breakdown, long maxTokens)
+    {
+        DayLabel = breakdown.Date.Day.ToString(CultureInfo.CurrentCulture);
+        TokensText = $"{breakdown.TokenUsage.TotalTokens:n0} tokens";
+        CostText = $"${breakdown.Cost:0.00}";
+        Height = breakdown.TokenUsage.TotalTokens == 0
+            ? 2
+            : Math.Max(6, Math.Round(breakdown.TokenUsage.TotalTokens / (double)Math.Max(1, maxTokens) * 84));
+    }
+
+    public string DayLabel { get; }
+    public string TokensText { get; }
+    public string CostText { get; }
+    public double Height { get; }
+}
+
+public sealed class TokenUsageModelRowViewModel(TokenUsageModelBreakdown breakdown)
+{
+    public string Model => breakdown.Model;
+    public string TokensText => $"{breakdown.TokenUsage.TotalTokens:n0}";
+    public string CostText => $"${breakdown.Cost:0.00}";
+}
+
+public sealed class AnthropicPricingRowViewModel(AnthropicModelPrice price)
+{
+    public string Model => price.Model;
+    public string InputText => $"${price.InputPerMillionTokens:0.##}";
+    public string CacheWrite5MinuteText => $"${price.CacheWrite5MinutePerMillionTokens:0.##}";
+    public string CacheWrite1HourText => $"${price.CacheWrite1HourPerMillionTokens:0.##}";
+    public string CacheReadText => $"${price.CacheReadPerMillionTokens:0.##}";
+    public string OutputText => $"${price.OutputPerMillionTokens:0.##}";
 }

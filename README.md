@@ -90,3 +90,9 @@ Current behavior:
 - Added the native Avalonia Windows desktop app for browsing, replaying, analyzing, sanitizing, and exporting Claude sessions.
 - Added collision-safe Markdown and HTML batch export for selected sessions from the filtered list.
 - Added responsive, cancellable startup scanning with partial results and explicit completion status.
+
+### 1.0.4
+
+- Expanded token analysis with input, output, cache write, cache read, total-token, daily-usage, model, and estimated-cost breakdowns.
+- Added refreshable Anthropic model pricing with separate 5-minute and 1-hour cache-write rates.
+- Added PNG, CSV, and Markdown exports for token statistics.

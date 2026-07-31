@@ -1,5 +1,8 @@
+﻿using System.Text;
+using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input.Platform;
+using Avalonia.Media.Imaging;
 using Avalonia.Platform.Storage;
 
 namespace Clodlogs.Desktop.Services;
@@ -89,6 +92,79 @@ public sealed class AvaloniaUiService(Window window, AppSettingsService settings
         }
 
         return NormalizeDialogPath(path);
+    }
+
+    public async Task<string?> SaveStatisticsTextAsync(string suggestedFileName, string extension, string content)
+    {
+        var normalizedExtension = extension.TrimStart('.').ToLowerInvariant();
+        var fileType = normalizedExtension switch
+        {
+            "csv" => new FilePickerFileType("CSV")
+            {
+                Patterns = ["*.csv"],
+                MimeTypes = ["text/csv"]
+            },
+            "md" => new FilePickerFileType("Markdown")
+            {
+                Patterns = ["*.md"],
+                MimeTypes = ["text/markdown"]
+            },
+            _ => throw new ArgumentOutOfRangeException(nameof(extension), extension, "Unsupported statistics export format.")
+        };
+        var file = await PickStatisticsFileAsync(
+            $"Save token statistics as {fileType.Name}",
+            suggestedFileName,
+            normalizedExtension,
+            fileType);
+        if (file is null)
+        {
+            return null;
+        }
+
+        await using var stream = await file.OpenWriteAsync();
+        if (stream.CanSeek)
+        {
+            stream.SetLength(0);
+        }
+        await using var writer = new StreamWriter(stream, new UTF8Encoding(false));
+        await writer.WriteAsync(content);
+        await writer.FlushAsync();
+        return await RememberStatisticsExportAsync(file);
+    }
+
+    public async Task<string?> SaveStatisticsImageAsync(string suggestedFileName)
+    {
+        var report = window.FindControl<Control>("TokenSummaryReport");
+        if (report is null || report.Bounds.Width <= 0 || report.Bounds.Height <= 0)
+        {
+            throw new InvalidOperationException("The token statistics report is not currently available for rendering.");
+        }
+
+        var pngType = new FilePickerFileType("PNG image")
+        {
+            Patterns = ["*.png"],
+            MimeTypes = ["image/png"]
+        };
+        var file = await PickStatisticsFileAsync("Save token statistics as image", suggestedFileName, "png", pngType);
+        if (file is null)
+        {
+            return null;
+        }
+
+        var scaling = Math.Max(1d, window.RenderScaling);
+        var pixelSize = new PixelSize(
+            Math.Max(1, (int)Math.Ceiling(report.Bounds.Width * scaling)),
+            Math.Max(1, (int)Math.Ceiling(report.Bounds.Height * scaling)));
+        using var bitmap = new RenderTargetBitmap(pixelSize, new Vector(96 * scaling, 96 * scaling));
+        bitmap.Render(report);
+        await using var stream = await file.OpenWriteAsync();
+        if (stream.CanSeek)
+        {
+            stream.SetLength(0);
+        }
+        bitmap.Save(stream, PngBitmapEncoderOptions.Default);
+        await stream.FlushAsync();
+        return await RememberStatisticsExportAsync(file);
     }
 
     public async Task CopyTextAsync(string text)
@@ -198,6 +274,43 @@ public sealed class AvaloniaUiService(Window window, AppSettingsService settings
         }
 
         return await window.StorageProvider.TryGetFolderFromPathAsync(path);
+    }
+
+    private async Task<IStorageFile?> PickStatisticsFileAsync(
+        string title,
+        string suggestedFileName,
+        string extension,
+        FilePickerFileType fileType)
+    {
+        if (!window.StorageProvider.CanSave)
+        {
+            return null;
+        }
+
+        var appSettings = await settings.ReadAsync();
+        var start = await TryGetFolderAsync(GetStartingFolder(appSettings.ExportDirectory));
+        return await window.StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions
+        {
+            Title = title,
+            SuggestedStartLocation = start,
+            SuggestedFileName = suggestedFileName,
+            DefaultExtension = extension,
+            FileTypeChoices = [fileType],
+            SuggestedFileType = fileType,
+            ShowOverwritePrompt = true
+        });
+    }
+
+    private async Task<string> RememberStatisticsExportAsync(IStorageFile file)
+    {
+        var path = file.TryGetLocalPath();
+        if (!string.IsNullOrWhiteSpace(path))
+        {
+            await settings.UpdateAsync(s => s.ExportDirectory = Path.GetDirectoryName(path));
+            return path;
+        }
+
+        return file.Name;
     }
 
     private static string? GetStartingFolder(string? candidate)

@@ -1,4 +1,4 @@
-<Window xmlns="https://github.com/avaloniaui"
+﻿<Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:Clodlogs.Desktop.ViewModels"
         x:Class="Clodlogs.Desktop.Views.MainWindow"
@@ -150,6 +150,7 @@
                 <MenuFlyout>
                   <MenuItem Header="Batch Export" Command="{CompiledBinding OpenBatchExportDialogCommand}" />
                   <MenuItem Header="Token Summary" Command="{CompiledBinding OpenTokenSummaryCommand}" />
+                  <MenuItem Header="Options" Command="{CompiledBinding OpenOptionsCommand}" />
                 </MenuFlyout>
               </Button.Flyout>
             </Button>
@@ -472,18 +473,155 @@
     </Border>
 
     <Border Grid.RowSpan="4" Background="#88000000" IsVisible="{CompiledBinding TokenSummaryDialogVisible}">
-      <Border Classes="panel" Width="720" Padding="20" HorizontalAlignment="Center" VerticalAlignment="Center">
-        <StackPanel Spacing="14">
-          <TextBlock Text="{CompiledBinding TokenSummaryTitle}" FontSize="24" FontWeight="Bold" />
-          <ProgressBar Minimum="0" Maximum="100" Value="{CompiledBinding TokenSummaryProgress}" />
-          <TextBlock Text="{CompiledBinding TokenSummaryMessage}" TextWrapping="Wrap" />
-          <TextBlock Text="{CompiledBinding TokenSummaryResultText}" FontSize="18" FontWeight="SemiBold" TextWrapping="Wrap" />
-          <WrapPanel HorizontalAlignment="Right">
-            <Button Classes="ghost" Content="Copy Summary" Command="{CompiledBinding CopyTokenSummaryCommand}" />
+      <Border Classes="panel" Width="900" MaxHeight="820" Padding="22" HorizontalAlignment="Center" VerticalAlignment="Center">
+        <Grid RowDefinitions="Auto,Auto,*,Auto" RowSpacing="14">
+          <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
+            <StackPanel Spacing="3">
+              <TextBlock Classes="kicker" Text="TOKEN ANALYSIS" />
+              <TextBlock Text="{CompiledBinding TokenSummaryTitle}" FontSize="24" FontWeight="Bold" />
+            </StackPanel>
+            <Button Grid.Column="1" Classes="ghost" Content="Export">
+              <Button.Flyout>
+                <MenuFlyout>
+                  <MenuItem Header="PNG Image" Command="{CompiledBinding ExportTokenSummaryCommand}" CommandParameter="png" />
+                  <MenuItem Header="CSV" Command="{CompiledBinding ExportTokenSummaryCommand}" CommandParameter="csv" />
+                  <MenuItem Header="Markdown" Command="{CompiledBinding ExportTokenSummaryCommand}" CommandParameter="md" />
+                </MenuFlyout>
+              </Button.Flyout>
+            </Button>
+            <Button Grid.Column="2" Classes="ghost" Content="Copy Summary" Command="{CompiledBinding CopyTokenSummaryCommand}" />
+          </Grid>
+          <StackPanel Grid.Row="1" Spacing="7">
+            <ProgressBar Minimum="0" Maximum="100" Value="{CompiledBinding TokenSummaryProgress}" />
+            <TextBlock Text="{CompiledBinding TokenSummaryMessage}" Classes="muted" TextWrapping="Wrap" />
+          </StackPanel>
+          <ScrollViewer Grid.Row="2" IsVisible="{CompiledBinding HasTokenSummaryResult}">
+            <Border x:Name="TokenSummaryReport" Background="{DynamicResource PanelBackgroundBrush}" Padding="4">
+              <StackPanel Spacing="18">
+              <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
+                <TextBlock Text="{CompiledBinding TokenSummaryPeriodTitle}" FontSize="24" FontWeight="SemiBold" />
+                <TextBlock Grid.Column="1" Text="{CompiledBinding TokenSummaryTotalCostText}" FontSize="24" FontWeight="Bold" Foreground="{DynamicResource AccentBrush}" />
+              </Grid>
+
+              <UniformGrid Columns="5" Rows="1">
+                <StackPanel Spacing="4" HorizontalAlignment="Center">
+                  <TextBlock Classes="muted" Text="Input" HorizontalAlignment="Center" />
+                  <TextBlock Text="{CompiledBinding TokenSummaryInputText}" FontSize="18" FontWeight="SemiBold" HorizontalAlignment="Center" />
+                </StackPanel>
+                <StackPanel Spacing="4" HorizontalAlignment="Center">
+                  <TextBlock Classes="muted" Text="Output" HorizontalAlignment="Center" />
+                  <TextBlock Text="{CompiledBinding TokenSummaryOutputText}" FontSize="18" FontWeight="SemiBold" HorizontalAlignment="Center" />
+                </StackPanel>
+                <StackPanel Spacing="4" HorizontalAlignment="Center">
+                  <TextBlock Classes="muted" Text="Cache Write" HorizontalAlignment="Center" />
+                  <TextBlock Text="{CompiledBinding TokenSummaryCacheWriteText}" FontSize="18" FontWeight="SemiBold" HorizontalAlignment="Center" />
+                </StackPanel>
+                <StackPanel Spacing="4" HorizontalAlignment="Center">
+                  <TextBlock Classes="muted" Text="Cache Read" HorizontalAlignment="Center" />
+                  <TextBlock Text="{CompiledBinding TokenSummaryCacheReadText}" FontSize="18" FontWeight="SemiBold" HorizontalAlignment="Center" />
+                </StackPanel>
+                <StackPanel Spacing="4" HorizontalAlignment="Center">
+                  <TextBlock Classes="muted" Text="Total" HorizontalAlignment="Center" />
+                  <TextBlock Text="{CompiledBinding TokenSummaryGrandTotalText}" FontSize="18" FontWeight="SemiBold" HorizontalAlignment="Center" />
+                </StackPanel>
+              </UniformGrid>
+
+              <StackPanel Spacing="8">
+                <TextBlock Classes="kicker" Text="DAILY USAGE" />
+                <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
+                  <ItemsControl ItemsSource="{CompiledBinding TokenSummaryDailyBars}">
+                    <ItemsControl.ItemsPanel>
+                      <ItemsPanelTemplate>
+                        <StackPanel Orientation="Horizontal" Spacing="8" />
+                      </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemTemplate>
+                      <DataTemplate x:DataType="vm:TokenUsageDailyBarViewModel">
+                        <Grid RowDefinitions="94,Auto" Width="26" ToolTip.Tip="{CompiledBinding TokensText}">
+                          <Border Width="13"
+                                  Height="{CompiledBinding Height}"
+                                  Background="#C7B3A093"
+                                  CornerRadius="3"
+                                  VerticalAlignment="Bottom"
+                                  HorizontalAlignment="Center" />
+                          <TextBlock Grid.Row="1" Text="{CompiledBinding DayLabel}" Classes="muted" HorizontalAlignment="Center" />
+                        </Grid>
+                      </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                  </ItemsControl>
+                </ScrollViewer>
+              </StackPanel>
+
+              <StackPanel Spacing="8">
+                <Grid ColumnDefinitions="2*,*,*" ColumnSpacing="12">
+                  <TextBlock Classes="kicker" Text="MODEL" />
+                  <TextBlock Grid.Column="1" Classes="kicker" Text="TOKENS" HorizontalAlignment="Right" />
+                  <TextBlock Grid.Column="2" Classes="kicker" Text="COST" HorizontalAlignment="Right" />
+                </Grid>
+                <ItemsControl ItemsSource="{CompiledBinding TokenSummaryModelRows}">
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate x:DataType="vm:TokenUsageModelRowViewModel">
+                      <Grid ColumnDefinitions="2*,*,*" ColumnSpacing="12" Margin="0,5">
+                        <TextBlock Text="{CompiledBinding Model}" TextTrimming="CharacterEllipsis" />
+                        <TextBlock Grid.Column="1" Text="{CompiledBinding TokensText}" HorizontalAlignment="Right" />
+                        <TextBlock Grid.Column="2" Text="{CompiledBinding CostText}" HorizontalAlignment="Right" FontWeight="SemiBold" />
+                      </Grid>
+                    </DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
+              </StackPanel>
+
+              <TextBlock Text="{CompiledBinding TokenSummaryResultText}" Classes="muted" TextWrapping="Wrap" />
+              <TextBlock Text="{CompiledBinding TokenSummaryPricingNote}" Classes="muted" TextWrapping="Wrap" />
+              </StackPanel>
+            </Border>
+          </ScrollViewer>
+          <WrapPanel Grid.Row="3" HorizontalAlignment="Right">
             <Button Classes="primary" Content="Close" Command="{CompiledBinding DismissDialogsCommand}" IsVisible="{CompiledBinding CanCloseTokenSummary}" />
             <Button Classes="ghost" Content="Cancel" Command="{CompiledBinding CancelTokenSummaryCommand}" IsVisible="{CompiledBinding IsTokenSummaryRunning}" />
           </WrapPanel>
-        </StackPanel>
+        </Grid>
+      </Border>
+    </Border>
+
+    <Border Grid.RowSpan="4" Background="#AA000000" IsVisible="{CompiledBinding OptionsDialogVisible}">
+      <Border Classes="panel" Width="940" MaxHeight="820" Padding="22" HorizontalAlignment="Center" VerticalAlignment="Center">
+        <Grid RowDefinitions="Auto,Auto,*,Auto" RowSpacing="14">
+          <StackPanel Spacing="3">
+            <TextBlock Classes="kicker" Text="OPTIONS" />
+            <TextBlock Text="Anthropic model pricing" FontSize="26" FontWeight="Bold" />
+            <TextBlock Text="{CompiledBinding PricingStatus}" Classes="muted" TextWrapping="Wrap" />
+            <SelectableTextBlock Text="{CompiledBinding PricingSourceUrl}" Classes="muted" TextWrapping="Wrap" />
+          </StackPanel>
+          <Grid Grid.Row="1" ColumnDefinitions="2*,*,*,*,*,*" ColumnSpacing="12" Margin="0,6,0,0">
+            <TextBlock Classes="kicker" Text="MODEL" />
+            <TextBlock Grid.Column="1" Classes="kicker" Text="INPUT" HorizontalAlignment="Right" />
+            <TextBlock Grid.Column="2" Classes="kicker" Text="CACHE WRITE (5 MIN)" HorizontalAlignment="Right" />
+            <TextBlock Grid.Column="3" Classes="kicker" Text="CACHE WRITE (1 H)" HorizontalAlignment="Right" />
+            <TextBlock Grid.Column="4" Classes="kicker" Text="CACHE READ" HorizontalAlignment="Right" />
+            <TextBlock Grid.Column="5" Classes="kicker" Text="OUTPUT" HorizontalAlignment="Right" />
+          </Grid>
+          <ScrollViewer Grid.Row="2">
+            <ItemsControl ItemsSource="{CompiledBinding AnthropicPricingRows}">
+              <ItemsControl.ItemTemplate>
+                <DataTemplate x:DataType="vm:AnthropicPricingRowViewModel">
+                  <Grid ColumnDefinitions="2*,*,*,*,*,*" ColumnSpacing="12" Margin="0,6">
+                    <TextBlock Text="{CompiledBinding Model}" TextTrimming="CharacterEllipsis" />
+                    <TextBlock Grid.Column="1" Text="{CompiledBinding InputText}" HorizontalAlignment="Right" />
+                    <TextBlock Grid.Column="2" Text="{CompiledBinding CacheWrite5MinuteText}" HorizontalAlignment="Right" />
+                    <TextBlock Grid.Column="3" Text="{CompiledBinding CacheWrite1HourText}" HorizontalAlignment="Right" />
+                    <TextBlock Grid.Column="4" Text="{CompiledBinding CacheReadText}" HorizontalAlignment="Right" />
+                    <TextBlock Grid.Column="5" Text="{CompiledBinding OutputText}" HorizontalAlignment="Right" />
+                  </Grid>
+                </DataTemplate>
+              </ItemsControl.ItemTemplate>
+            </ItemsControl>
+          </ScrollViewer>
+          <WrapPanel Grid.Row="3" HorizontalAlignment="Right">
+            <Button Classes="primary" Content="{CompiledBinding PricingRefreshButtonText}" Command="{CompiledBinding RefreshPricingCommand}" />
+            <Button Classes="ghost" Content="Close" Command="{CompiledBinding DismissDialogsCommand}" />
+          </WrapPanel>
+        </Grid>
       </Border>
     </Border>
 
