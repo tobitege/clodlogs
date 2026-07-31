@@ -90,6 +90,7 @@ Current behavior:
 - Added the native Avalonia Windows desktop app for browsing, replaying, analyzing, sanitizing, and exporting Claude sessions.
 - Added collision-safe Markdown and HTML batch export for selected sessions from the filtered list.
 - Added responsive, cancellable startup scanning with partial results and explicit completion status.
+- Updated the Avalonia desktop packages to 12.1.1.
 
 ### 1.0.4
 
