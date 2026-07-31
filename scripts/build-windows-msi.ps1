@@ -256,7 +256,7 @@ $shortcutComponentGuid = New-StableGuid -Value "shortcut:start-menu"
 [void] $builder.AppendLine("      <Component Id=`"ApplicationShortcut`" Guid=`"$shortcutComponentGuid`" Win64=`"yes`">")
 [void] $builder.AppendLine("        <Shortcut Id=`"ApplicationStartMenuShortcut`" Name=`"$productNameXml`" Description=`"$shortcutDescription`" Target=`"[INSTALLFOLDER]$relativeShortcutTarget`" WorkingDirectory=`"INSTALLFOLDER`" />")
 [void] $builder.AppendLine('        <RemoveFolder Id="ApplicationProgramsFolder" On="uninstall" />')
-[void] $builder.AppendLine('        <RegistryValue Root="HKLM" Key="Software\clodlogs" Name="installed" Type="integer" Value="1" KeyPath="yes" />')
+[void] $builder.AppendLine('        <RegistryValue Root="HKCU" Key="Software\clodlogs" Name="installed" Type="integer" Value="1" KeyPath="yes" />')
 [void] $builder.AppendLine('      </Component>')
 [void] $builder.AppendLine('    </DirectoryRef>')
 [void] $builder.AppendLine('    <Feature Id="MainFeature" Title="clodlogs" Level="1">')
