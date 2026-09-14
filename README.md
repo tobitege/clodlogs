@@ -97,3 +97,12 @@ Current behavior:
 - Expanded token analysis with input, output, cache write, cache read, total-token, daily-usage, model, and estimated-cost breakdowns.
 - Added refreshable Anthropic model pricing with separate 5-minute and 1-hour cache-write rates.
 - Added PNG, CSV, and Markdown exports for token statistics.
+
+### 1.0.5
+
+- Fixed the tool-call option in HTML and Markdown exports, including batch exports, and removed duplicate tool and thinking content.
+- Preserved Claude content block order and added support for plain-text messages and native Claude images, including images in tool results.
+- Protected existing export files from failed or cancelled replacements and added collision-safe names for automatic single-session exports.
+- Kept batch exports running after individual filename reservation failures and rejected unsupported export formats.
+- Reported image write failures and fixed image asset collisions and links containing spaces or special characters.
+- Updated the Avalonia desktop packages to 12.1.2.

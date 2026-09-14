@@ -8,6 +8,16 @@ var tests = new List<(string Name, Func<Task> Run)>
     ("response_item transcript parsing", TestResponseItemTranscriptAsync),
     ("markdown export response items and images", TestMarkdownExportResponseItemsAndImagesAsync),
     ("html export inlines response item images", TestHtmlExportInlineImagesAsync),
+    ("native Claude export honors tool options without duplicates", TestNativeClaudeToolOptionsAsync),
+    ("native Claude transcript preserves block order and string messages", TestNativeClaudeTranscriptAsync),
+    ("native Claude images honor image and tool options", TestNativeClaudeImageOptionsAsync),
+    ("single export avoids automatic filename collisions", TestSingleExportCollisionsAsync),
+    ("failed export preserves existing output and reports image I/O errors", TestFailedExportPreservesOutputAsync),
+    ("image asset names and links handle collisions and special characters", TestImageAssetLinksAsync),
+    ("single export rejects unsupported formats", TestInvalidExportFormat),
+    ("explicit export replacement preserves unrelated assets", TestExplicitExportReplacementAsync),
+    ("cancelled export preserves previous output and assets", TestExportCancellationAsync),
+    ("image URLs and invalid image data are handled consistently", TestImageSourcesAsync),
     ("batch export names files and avoids collisions", TestBatchExportNamingAndCollisionAsync),
     ("batch export reserves around external asset collisions", TestBatchExportAssetCollisionsAsync),
     ("batch path reservation preserves cancellation and I/O failures", TestBatchPathReservationFailures),
@@ -178,6 +188,268 @@ static async Task TestMarkdownExportResponseItemsAndImagesAsync()
     AssertTrue(File.Exists(Path.Combine(outputDirectory, "sample-assets", "image-001.png")), "image asset exists");
 }
 
+static string WriteNativeClaudeSession(TempFixture fixture)
+    => fixture.WriteSession("""
+        {"type":"user","sessionId":"native-session","cwd":"C:\\repo","timestamp":"2026-09-14T10:00:00Z","message":{"role":"user","content":"STRING-USER"}}
+        {"type":"assistant","timestamp":"2026-09-14T10:00:01Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"THINKING-MARKER"},{"type":"text","text":"BEFORE-TOOL"},{"type":"tool_use","id":"call-1","name":"shell","input":{"command":"TOOL-INPUT-MARKER"}},{"type":"text","text":"AFTER-TOOL"}]}}
+        {"type":"user","timestamp":"2026-09-14T10:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":[{"type":"text","text":"TOOL-OUTPUT-MARKER"}]}]}}
+        {"type":"assistant","timestamp":"2026-09-14T10:00:03Z","message":{"role":"assistant","content":[{"type":"text","text":"FINAL-ANSWER"}]}}
+        """);
+
+static async Task TestNativeClaudeToolOptionsAsync()
+{
+    foreach (var format in new[] { "markdown", "html" })
+    foreach (var batch in new[] { false, true })
+    foreach (var includeTools in new[] { false, true })
+    {
+        using var fixture = new TempFixture();
+        var sessionPath = WriteNativeClaudeSession(fixture);
+        var outputDirectory = Path.Combine(fixture.Root, "export");
+        var service = new ClaudeSessionService();
+        string outputPath;
+        if (batch)
+        {
+            var job = service.StartBatchExportJob(format, [new(sessionPath, "Native", null)], false, false, includeTools, outputDirectory);
+            var status = await WaitForBatchExportAsync(() => service.GetBatchExportJobStatus(job.JobId));
+            AssertEqual("success", status.Kind, "native batch export");
+            outputPath = Directory.GetFiles(outputDirectory).Single();
+        }
+        else
+        {
+            var job = service.StartExportJob(format, sessionPath, false, false, includeTools, outputDirectory, null);
+            var status = await WaitForExportAsync(() => service.GetExportJobStatus(job.JobId));
+            AssertEqual("success", status.Kind, "native single export");
+            outputPath = status.OutputPath!;
+        }
+
+        var exported = await File.ReadAllTextAsync(outputPath);
+        foreach (var marker in new[] { "TOOL-INPUT-MARKER", "TOOL-OUTPUT-MARKER" })
+        {
+            AssertEqual(includeTools ? 1 : 0, exported.Split(marker).Length - 1, $"{format}, batch={batch}, tools={includeTools}: {marker}");
+        }
+        foreach (var marker in new[] { "STRING-USER", "THINKING-MARKER", "BEFORE-TOOL", "AFTER-TOOL", "FINAL-ANSWER" })
+        {
+            AssertEqual(1, exported.Split(marker).Length - 1, $"message appears once: {marker}");
+        }
+        AssertTrue(exported.IndexOf("THINKING-MARKER", StringComparison.Ordinal) < exported.IndexOf("BEFORE-TOOL", StringComparison.Ordinal), "thinking precedes message");
+        if (includeTools)
+        {
+            AssertTrue(exported.IndexOf("TOOL-INPUT-MARKER", StringComparison.Ordinal) < exported.IndexOf("AFTER-TOOL", StringComparison.Ordinal), "tool precedes following text");
+        }
+    }
+}
+
+static async Task TestNativeClaudeTranscriptAsync()
+{
+    using var fixture = new TempFixture();
+    var service = new ClaudeSessionService();
+    var transcript = await service.ReadSessionTranscriptAsync(WriteNativeClaudeSession(fixture));
+    AssertEqual(7, transcript.Entries.Count, "no duplicate or empty message entries");
+    AssertEqual("STRING-USER", transcript.Entries[0].Text, "string message");
+    AssertEqual(SessionTranscriptEntryKind.Reasoning, transcript.Entries[1].Kind, "thinking block order");
+    AssertEqual("BEFORE-TOOL", transcript.Entries[2].Text, "text before tool");
+    AssertEqual(SessionTranscriptEntryKind.ToolCall, transcript.Entries[3].Kind, "tool block order");
+    AssertEqual("AFTER-TOOL", transcript.Entries[4].Text, "text after tool");
+    AssertEqual(SessionTranscriptEntryKind.ToolOutput, transcript.Entries[5].Kind, "tool-only message has no user bubble");
+}
+
+static async Task TestNativeClaudeImageOptionsAsync()
+{
+    foreach (var format in new[] { "markdown", "html" })
+    foreach (var inlineImages in new[] { false, true })
+    foreach (var includeImages in new[] { false, true })
+    foreach (var includeTools in new[] { false, true })
+    {
+        using var fixture = new TempFixture();
+        var sessionPath = fixture.WriteSession("""
+            {"type":"user","message":{"role":"user","content":[{"type":"text","text":"IMAGE-MESSAGE","url":"https://example.com/reference"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}},{"type":"text","text":"AFTER-IMAGE"}]}}
+            {"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"image-call","content":[{"type":"text","text":"IMAGE-TOOL-RESULT"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"d29ybGQ="}}]}]}}
+            """);
+        var service = new ClaudeSessionService();
+        var job = service.StartExportJob(format, sessionPath, includeImages, inlineImages, includeTools, fixture.Root, null);
+        var status = await WaitForExportAsync(() => service.GetExportJobStatus(job.JobId));
+        AssertEqual("success", status.Kind, "native image export");
+        var exported = await File.ReadAllTextAsync(status.OutputPath!);
+        AssertContains("IMAGE-MESSAGE", exported, "text with a URL is preserved");
+        AssertEqual(includeTools, exported.Contains("IMAGE-TOOL-RESULT", StringComparison.Ordinal), "tool image output follows tool option");
+        var expectedImages = includeImages ? includeTools ? 2 : 1 : 0;
+        var imageMarker = format == "html" ? "<img " : "![";
+        AssertEqual(expectedImages, exported.Split(imageMarker).Length - 1, "rendered image count");
+        if (includeImages)
+        {
+            AssertTrue(exported.IndexOf(imageMarker, StringComparison.Ordinal) < exported.IndexOf("AFTER-IMAGE", StringComparison.Ordinal), "image stays between surrounding text blocks");
+        }
+        var externalImages = Directory.GetFiles(fixture.Root, "*.png", SearchOption.AllDirectories);
+        AssertEqual(format == "html" && inlineImages ? 0 : expectedImages, externalImages.Length, "only included images create assets");
+        if (!includeImages)
+        {
+            AssertTrue(!exported.Contains("aGVsbG8=", StringComparison.Ordinal) && !exported.Contains("d29ybGQ=", StringComparison.Ordinal), "excluded image data never leaks");
+        }
+    }
+}
+
+static async Task TestSingleExportCollisionsAsync()
+{
+    foreach (var format in new[] { "markdown", "html" })
+    {
+        using var fixture = new TempFixture();
+        var sessionPath = WriteNativeClaudeSession(fixture);
+        var originalPath = Path.Combine(fixture.Root, format == "html" ? "sample.html" : "sample.md");
+        await File.WriteAllTextAsync(originalPath, "EXISTING-EXPORT");
+        var service = new ClaudeSessionService();
+        var job = service.StartExportJob(format, sessionPath, false, false, false, fixture.Root, null);
+        var status = await WaitForExportAsync(() => service.GetExportJobStatus(job.JobId));
+        AssertEqual("success", status.Kind, "collision export status");
+        AssertEqual("EXISTING-EXPORT", await File.ReadAllTextAsync(originalPath), "automatic export preserves existing file");
+        AssertTrue(status.OutputPath != originalPath, "new output has a distinct filename");
+    }
+}
+
+static async Task TestFailedExportPreservesOutputAsync()
+{
+    foreach (var format in new[] { "markdown", "html" })
+    {
+        using var fixture = new TempFixture();
+        var sessionPath = fixture.WriteSession("""
+            {"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,aGVsbG8="}]}}
+            """);
+        var outputPath = Path.Combine(fixture.Root, format == "html" ? "existing.html" : "existing.md");
+        await File.WriteAllTextAsync(outputPath, "EXISTING-EXPORT");
+        await File.WriteAllTextAsync(Path.Combine(fixture.Root, "existing-assets"), "ASSET-PATH-BLOCKED");
+        var service = new ClaudeSessionService();
+        var job = service.StartExportJob(format, sessionPath, true, false, true, null, outputPath);
+        var status = await WaitForExportAsync(() => service.GetExportJobStatus(job.JobId));
+        AssertEqual("error", status.Kind, "image I/O failure is reported");
+        AssertEqual("EXISTING-EXPORT", await File.ReadAllTextAsync(outputPath), "failed replacement preserves existing export");
+        AssertEqual(0, Directory.GetFiles(fixture.Root, "*.tmp").Length, "partial export is cleaned up");
+    }
+}
+
+static async Task TestImageAssetLinksAsync()
+{
+    using var fixture = new TempFixture();
+    var sessionPath = fixture.WriteSession("""
+        {"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,aGVsbG8="}]}}
+        """);
+    var outputPath = Path.Combine(fixture.Root, "image path (one)#.md");
+    var assetName = "image path (one)#-assets";
+    Directory.CreateDirectory(Path.Combine(fixture.Root, assetName, "image-001.png"));
+    var service = new ClaudeSessionService();
+    var job = service.StartExportJob("markdown", sessionPath, true, false, false, null, outputPath);
+    var status = await WaitForExportAsync(() => service.GetExportJobStatus(job.JobId));
+    AssertEqual("success", status.Kind, "asset directory collision is skipped");
+    var exported = await File.ReadAllTextAsync(outputPath);
+    AssertContains($"./{Uri.EscapeDataString(assetName)}/image-002.png", exported, "asset link is URL encoded");
+    AssertEqual("hello", await File.ReadAllTextAsync(Path.Combine(fixture.Root, assetName, "image-002.png")), "asset bytes are preserved");
+}
+
+static Task TestInvalidExportFormat()
+{
+    using var fixture = new TempFixture();
+    var service = new ClaudeSessionService();
+    try
+    {
+        service.StartExportJob("invalid", WriteNativeClaudeSession(fixture), false, false, false, fixture.Root, null);
+    }
+    catch (ArgumentException)
+    {
+        AssertEqual(1, Directory.GetFiles(fixture.Root).Length, "invalid format creates no output");
+        return Task.CompletedTask;
+    }
+    throw new InvalidOperationException("unsupported format must be rejected before starting a job");
+}
+
+static async Task TestExplicitExportReplacementAsync()
+{
+    foreach (var format in new[] { "markdown", "html" })
+    {
+        using var fixture = new TempFixture();
+        var sessionPath = WriteNativeClaudeSession(fixture);
+        var originalSource = await File.ReadAllTextAsync(sessionPath);
+        var outputPath = Path.Combine(fixture.Root, format == "html" ? "existing.html" : "existing.md");
+        await File.WriteAllTextAsync(outputPath, "PREVIOUS-EXPORT");
+        var assets = Path.Combine(fixture.Root, "existing-assets");
+        Directory.CreateDirectory(assets);
+        var unrelatedAsset = Path.Combine(assets, "image-001.png");
+        await File.WriteAllTextAsync(unrelatedAsset, "PREVIOUS-ASSET");
+        var service = new ClaudeSessionService();
+        var job = service.StartExportJob(format, sessionPath, true, false, false, null, outputPath);
+        var status = await WaitForExportAsync(() => service.GetExportJobStatus(job.JobId));
+        AssertEqual("success", status.Kind, "explicit replacement succeeds");
+        var exported = await File.ReadAllTextAsync(outputPath);
+        AssertContains("FINAL-ANSWER", exported, "explicit destination contains completed export");
+        AssertTrue(!exported.Contains("PREVIOUS-EXPORT", StringComparison.Ordinal), "old content is replaced");
+        AssertEqual("PREVIOUS-ASSET", await File.ReadAllTextAsync(unrelatedAsset), "unrelated asset remains unchanged");
+        AssertEqual(originalSource, await File.ReadAllTextAsync(sessionPath), "source session remains unchanged");
+        AssertEqual(0, Directory.GetFiles(fixture.Root, "*.tmp").Length, "no temporary output remains");
+    }
+}
+
+static async Task TestExportCancellationAsync()
+{
+    foreach (var format in new[] { "markdown", "html" })
+    {
+        using var fixture = new TempFixture();
+        var sessionPath = fixture.WriteSession("""
+            {"type":"user","message":{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}}]}}
+            {"type":"assistant","message":{"role":"assistant","content":"AFTER-CANCELLATION"}}
+            """);
+        var outputPath = Path.Combine(fixture.Root, format == "html" ? "existing.html" : "existing.md");
+        await File.WriteAllTextAsync(outputPath, "PREVIOUS-EXPORT");
+        var assets = Path.Combine(fixture.Root, "existing-assets");
+        Directory.CreateDirectory(assets);
+        var existingAsset = Path.Combine(assets, "image-001.png");
+        await File.WriteAllTextAsync(existingAsset, "PREVIOUS-ASSET");
+        using var cancellation = new CancellationTokenSource();
+        Action<ExportJobStatus> progress = status =>
+        {
+            if (status.Stage == "rendering") cancellation.Cancel();
+        };
+        var method = typeof(ClaudeSessionService).GetMethod("ExportSessionJsonlAsync", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("Export method not found.");
+        var export = (Task<string>)method.Invoke(new ClaudeSessionService(),
+            [format, sessionPath, true, false, true, null, outputPath, progress, cancellation.Token])!;
+        try
+        {
+            await export;
+            throw new InvalidOperationException("Export should be cancelled after the first rendered record.");
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        AssertEqual("PREVIOUS-EXPORT", await File.ReadAllTextAsync(outputPath), "cancelled replacement preserves previous export");
+        AssertEqual("PREVIOUS-ASSET", await File.ReadAllTextAsync(existingAsset), "cancelled replacement preserves previous asset");
+        AssertEqual(1, Directory.GetFiles(assets).Length, "only newly created assets are removed");
+        AssertEqual(0, Directory.GetFiles(fixture.Root, "*.tmp").Length, "cancelled output is cleaned up");
+    }
+}
+
+static async Task TestImageSourcesAsync()
+{
+    foreach (var format in new[] { "markdown", "html" })
+    foreach (var inline in new[] { false, true })
+    {
+        using var fixture = new TempFixture();
+        var sessionPath = fixture.WriteSession("""
+            {"type":"user","message":{"role":"user","content":[{"type":"image","source":{"type":"url","url":"https://example.com/image%20name%20(one).png"}}]}}
+            """);
+        var service = new ClaudeSessionService();
+        var job = service.StartExportJob(format, sessionPath, true, inline, false, fixture.Root, null);
+        var status = await WaitForExportAsync(() => service.GetExportJobStatus(job.JobId));
+        AssertEqual("success", status.Kind, "native URL image exports");
+        AssertContains("https://example.com/image%20name%20%28one%29.png", await File.ReadAllTextAsync(status.OutputPath!), "URL is safe in an image link");
+
+        var invalidPath = fixture.WriteSession("""
+            {"type":"user","message":{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"invalid!"}}]}}
+            """, "invalid-image.jsonl");
+        var invalidJob = service.StartExportJob(format, invalidPath, true, inline, false, fixture.Root, null);
+        var invalidStatus = await WaitForExportAsync(() => service.GetExportJobStatus(invalidJob.JobId));
+        AssertEqual("error", invalidStatus.Kind, "invalid image data is reported");
+        AssertContains("base64", invalidStatus.Message, "image error identifies invalid data");
+        AssertEqual(0, Directory.GetFiles(fixture.Root, "*.tmp").Length, "invalid image leaves no temporary file");
+    }
+}
+
 static async Task TestSanitizedCopyAsync()
 {
     using var fixture = new TempFixture();
@@ -302,7 +574,7 @@ static Task TestBatchPathReservationFailures()
 {
     using var fixture = new TempFixture();
     var method = typeof(ClaudeSessionService).GetMethod(
-        "CreateAvailableBatchExportPath",
+        "CreateAvailableExportPath",
         BindingFlags.NonPublic | BindingFlags.Static)
         ?? throw new InvalidOperationException("Batch path reservation method not found.");
     var missingDirectory = Path.Combine(fixture.Root, "missing");

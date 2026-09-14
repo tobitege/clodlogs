@@ -441,6 +441,7 @@ public sealed class ClaudeSessionService
         string? outputDirectory,
         string? outputPath)
     {
+        ValidateExportFormat(format);
         var jobId = Guid.NewGuid().ToString("N");
         var record = new JobRecord<ExportJobStatus>(
             new CancellationTokenSource(),
@@ -454,9 +455,7 @@ public sealed class ClaudeSessionService
         {
             try
             {
-                var path = format == "markdown"
-                    ? await ExportSessionJsonlToMarkdownAsync(sessionFilePath, includeImages, includeToolCallResults, outputDirectory, outputPath, progress => SetExportStatus(jobId, progress), record.Cancellation.Token)
-                    : await ExportSessionJsonlToHtmlAsync(sessionFilePath, includeImages, inlineImages, includeToolCallResults, outputDirectory, outputPath, progress => SetExportStatus(jobId, progress), record.Cancellation.Token);
+                var path = await ExportSessionJsonlAsync(format, sessionFilePath, includeImages, inlineImages, includeToolCallResults, outputDirectory, outputPath, progress => SetExportStatus(jobId, progress), record.Cancellation.Token);
                 SetExportStatus(jobId, new ExportJobStatus("success", 100, "done", $"{ToTitleCase(format)} written to {path}", path));
             }
             catch (OperationCanceledException)
@@ -482,11 +481,7 @@ public sealed class ClaudeSessionService
         bool includeToolCallResults,
         string outputDirectory)
     {
-        if (format is not ("markdown" or "html"))
-        {
-            throw new ArgumentException("Batch export format must be markdown or html.", nameof(format));
-        }
-
+        ValidateExportFormat(format);
         var batch = sessions.ToArray();
         var jobId = Guid.NewGuid().ToString("N");
         var record = new JobRecord<BatchExportJobStatus>(
@@ -517,19 +512,12 @@ public sealed class ClaudeSessionService
                 {
                     record.Cancellation.Token.ThrowIfCancellationRequested();
                     var session = batch[index];
-                    var proposedName = BuildBatchExportFileName(session.SessionName, session.StartedAt, format);
-                    var outputPath = CreateAvailableBatchExportPath(resolvedOutputDirectory, proposedName, needsExternalAssets, record.Cancellation.Token);
-                    var displayName = Path.GetFileName(outputPath);
-                    SetBatchExportStatus(jobId, new BatchExportJobStatus(
-                        "working",
-                        Math.Max(1, (int)Math.Round(index / (double)batch.Length * 100)),
-                        "exporting",
-                        $"Exporting {index + 1} of {batch.Length}: {displayName}",
-                        resolvedOutputDirectory,
-                        null));
-
+                    string? outputPath = null;
                     try
                     {
+                        var proposedName = BuildBatchExportFileName(session.SessionName, session.StartedAt, format);
+                        outputPath = CreateAvailableExportPath(resolvedOutputDirectory, proposedName, needsExternalAssets, record.Cancellation.Token);
+                        var displayName = Path.GetFileName(outputPath);
                         void Report(ExportJobStatus status)
                         {
                             var progress = Math.Clamp((int)Math.Round((index + status.ProgressPercent / 100d) / batch.Length * 100), 1, 99);
@@ -542,25 +530,19 @@ public sealed class ClaudeSessionService
                                 null));
                         }
 
-                        if (format == "markdown")
-                        {
-                            await ExportSessionJsonlToMarkdownAsync(session.SessionFilePath, includeImages, includeToolCallResults, null, outputPath, Report, record.Cancellation.Token);
-                        }
-                        else
-                        {
-                            await ExportSessionJsonlToHtmlAsync(session.SessionFilePath, includeImages, inlineImages, includeToolCallResults, null, outputPath, Report, record.Cancellation.Token);
-                        }
+                        Report(new ExportJobStatus("working", 0, "exporting", "", null));
+                        await ExportSessionJsonlAsync(format, session.SessionFilePath, includeImages, inlineImages, includeToolCallResults, null, outputPath, Report, record.Cancellation.Token);
                         succeeded++;
                     }
                     catch (OperationCanceledException)
                     {
                         // The zero-byte reservation may predate export setup and must always be released.
-                        TryDeleteFile(outputPath);
+                        if (outputPath is not null) TryDeleteFile(outputPath);
                         throw;
                     }
                     catch (Exception ex)
                     {
-                        TryDeleteFile(outputPath);
+                        if (outputPath is not null) TryDeleteFile(outputPath);
                         failures.Add(new BatchExportFailure(session.SessionFilePath, ex.Message));
                     }
                 }
@@ -1086,100 +1068,16 @@ public sealed class ClaudeSessionService
         return $"{safeName} - {timestamp}{extension}";
     }
 
-    private async Task<string> ExportSessionJsonlToMarkdownAsync(
-        string inputPath,
-        bool includeImages,
-        bool includeToolCallResults,
-        string? outputDirectory,
-        string? outputPath,
-        Action<ExportJobStatus> progress,
-        CancellationToken cancellationToken)
+    private static void ValidateExportFormat(string format)
     {
-        var sessionFilePath = ResolveFilesystemPath(inputPath);
-        EnsureJsonl(sessionFilePath);
-        var resolvedOutputPath = string.IsNullOrWhiteSpace(outputPath)
-            ? Path.Combine(ResolveOutputDirectory(sessionFilePath, outputDirectory), $"{Path.GetFileNameWithoutExtension(sessionFilePath)}.md")
-            : EnsureMarkdownOutputPath(ResolveFilesystemPath(outputPath));
-        var outputDirectoryPath = Path.GetDirectoryName(resolvedOutputPath)!;
-        Directory.CreateDirectory(outputDirectoryPath);
-        var meta = await ReadSessionExportMetadataAsync(sessionFilePath, cancellationToken);
-        var fileSize = new FileInfo(sessionFilePath).Length;
-        progress(new ExportJobStatus("working", 4, "reading", "Preparing Markdown export...", null));
-
-        var assetDirectoryName = $"{Path.GetFileNameWithoutExtension(resolvedOutputPath)}-assets";
-        var imageContext = new ExportImageContext(ExportImageRenderMode.Markdown, includeImages, false, outputDirectoryPath, assetDirectoryName);
-        try
+        if (format is not ("markdown" or "html"))
         {
-            await using var stream = File.Create(resolvedOutputPath);
-            await using var writer = new StreamWriter(stream, new UTF8Encoding(false));
-            await writer.WriteLineAsync("# Claude Session Export");
-            await writer.WriteLineAsync();
-            await writer.WriteLineAsync($"- Source JSONL: `{sessionFilePath}`");
-            await writer.WriteLineAsync($"- Session ID: `{meta.Id}`");
-            await writer.WriteLineAsync($"- Started: {meta.StartedAt ?? "unknown"}");
-            await writer.WriteLineAsync($"- CWD: `{meta.Cwd}`");
-            await writer.WriteLineAsync($"- Originator: {meta.Originator ?? "unknown"}");
-            await writer.WriteLineAsync($"- CLI Version: {meta.CliVersion ?? "unknown"}");
-            await writer.WriteLineAsync($"- Source: {meta.Source ?? "unknown"}");
-            await writer.WriteLineAsync($"- Model Provider: {meta.ModelProvider ?? "unknown"}");
-            await writer.WriteLineAsync($"- Included images: {(includeImages ? "yes" : "no")}");
-            await writer.WriteLineAsync($"- Included tool calls and results: {(includeToolCallResults ? "yes" : "no")}");
-            await writer.WriteLineAsync($"- Exported: {DateTimeOffset.Now:O}");
-            await writer.WriteLineAsync();
-            await writer.WriteLineAsync("## Transcript");
-            await writer.WriteLineAsync();
-
-            var transcriptCount = 0;
-            var omittedBootstrapMessages = 0;
-            var sawFirstUser = false;
-            await foreach (var evt in StreamJsonlRecordsAsync(sessionFilePath, ExportMaxJsonlLineBytes, true, cancellationToken))
-            {
-                if (evt.Record is null)
-                {
-                    continue;
-                }
-
-                var built = BuildTranscriptEntries(evt.Record, transcriptCount, sawFirstUser, imageContext);
-                sawFirstUser = built.SawFirstUserMessage;
-                omittedBootstrapMessages += built.OmittedBootstrapMessages;
-                foreach (var entry in built.Entries.Where(entry => ShouldIncludeTranscriptEntry(entry, includeToolCallResults)))
-                {
-                    if (transcriptCount > 0)
-                    {
-                        await writer.WriteLineAsync();
-                        await writer.WriteLineAsync();
-                    }
-
-                    await writer.WriteAsync(RenderMarkdownTranscriptEntry(entry));
-                    transcriptCount++;
-                }
-
-                ReportByteProgress(progress, evt.BytesProcessed, fileSize, "rendering", 10, 82, "Rendering Markdown transcript...");
-            }
-
-            if (omittedBootstrapMessages > 0)
-            {
-                await writer.WriteLineAsync();
-                await writer.WriteLineAsync($"_Omitted bootstrap messages: {omittedBootstrapMessages}_");
-            }
-
-            if (transcriptCount == 0)
-            {
-                await writer.WriteLineAsync("_No transcript items were found in the response stream._");
-            }
+            throw new ArgumentException("Export format must be markdown or html.", nameof(format));
         }
-        catch
-        {
-            TryDeleteFile(resolvedOutputPath);
-            imageContext.CleanupAssetDirectory();
-            throw;
-        }
-
-        progress(new ExportJobStatus("working", 100, "writing", "Markdown export ready.", resolvedOutputPath));
-        return resolvedOutputPath;
     }
 
-    private async Task<string> ExportSessionJsonlToHtmlAsync(
+    private async Task<string> ExportSessionJsonlAsync(
+        string format,
         string inputPath,
         bool includeImages,
         bool inlineImages,
@@ -1191,58 +1089,95 @@ public sealed class ClaudeSessionService
     {
         var sessionFilePath = ResolveFilesystemPath(inputPath);
         EnsureJsonl(sessionFilePath);
-        var resolvedOutputPath = string.IsNullOrWhiteSpace(outputPath)
-            ? Path.Combine(ResolveOutputDirectory(sessionFilePath, outputDirectory), $"{Path.GetFileNameWithoutExtension(sessionFilePath)}.html")
-            : EnsureHtmlOutputPath(ResolveFilesystemPath(outputPath));
-        Directory.CreateDirectory(Path.GetDirectoryName(resolvedOutputPath)!);
         var meta = await ReadSessionExportMetadataAsync(sessionFilePath, cancellationToken);
         var fileSize = new FileInfo(sessionFilePath).Length;
-        progress(new ExportJobStatus("working", 4, "reading", "Preparing HTML export...", null));
-
-        var htmlOutputDirectory = Path.GetDirectoryName(resolvedOutputPath)!;
-        var htmlAssetDirectoryName = $"{Path.GetFileNameWithoutExtension(resolvedOutputPath)}-assets";
-        var htmlImageContext = new ExportImageContext(ExportImageRenderMode.Html, includeImages, inlineImages, htmlOutputDirectory, htmlAssetDirectoryName);
+        var isHtml = format == "html";
+        var automaticPath = string.IsNullOrWhiteSpace(outputPath);
+        var directory = automaticPath
+            ? ResolveOutputDirectory(sessionFilePath, outputDirectory)
+            : Path.GetDirectoryName(ResolveFilesystemPath(outputPath!))!;
+        Directory.CreateDirectory(directory);
+        var resolvedOutputPath = automaticPath
+            ? CreateAvailableExportPath(directory, $"{Path.GetFileNameWithoutExtension(sessionFilePath)}.{(isHtml ? "html" : "md")}", includeImages && (!isHtml || !inlineImages), cancellationToken)
+            : isHtml ? EnsureHtmlOutputPath(ResolveFilesystemPath(outputPath!)) : EnsureMarkdownOutputPath(ResolveFilesystemPath(outputPath!));
+        var temporaryPath = Path.Combine(directory, $".clodlogs-{Guid.NewGuid():N}.tmp");
+        var imageContext = new ExportImageContext(
+            isHtml ? ExportImageRenderMode.Html : ExportImageRenderMode.Markdown,
+            includeImages, inlineImages, directory, $"{Path.GetFileNameWithoutExtension(resolvedOutputPath)}-assets");
         try
         {
-            await using var stream = File.Create(resolvedOutputPath);
-            await using var writer = new StreamWriter(stream, new UTF8Encoding(false));
-            await writer.WriteAsync(BuildHtmlExportPrefix(sessionFilePath, meta, includeImages, inlineImages, includeToolCallResults));
-
-            var transcriptCount = 0;
-            var sawFirstUser = false;
-            await foreach (var evt in StreamJsonlRecordsAsync(sessionFilePath, ExportMaxJsonlLineBytes, true, cancellationToken))
+            progress(new ExportJobStatus("working", 4, "reading", $"Preparing {format} export...", null));
+            await using (var stream = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            await using (var writer = new StreamWriter(stream, new UTF8Encoding(false)))
             {
-                if (evt.Record is null)
+                if (isHtml)
                 {
-                    continue;
+                    await writer.WriteAsync(BuildHtmlExportPrefix(sessionFilePath, meta, includeImages, inlineImages, includeToolCallResults));
+                }
+                else
+                {
+                    await writer.WriteLineAsync("# Claude Session Export");
+                    await writer.WriteLineAsync();
+                    await writer.WriteLineAsync($"- Source JSONL: `{sessionFilePath}`");
+                    await writer.WriteLineAsync($"- Session ID: `{meta.Id}`");
+                    await writer.WriteLineAsync($"- Started: {meta.StartedAt ?? "unknown"}");
+                    await writer.WriteLineAsync($"- CWD: `{meta.Cwd}`");
+                    await writer.WriteLineAsync($"- Originator: {meta.Originator ?? "unknown"}");
+                    await writer.WriteLineAsync($"- CLI Version: {meta.CliVersion ?? "unknown"}");
+                    await writer.WriteLineAsync($"- Source: {meta.Source ?? "unknown"}");
+                    await writer.WriteLineAsync($"- Model Provider: {meta.ModelProvider ?? "unknown"}");
+                    await writer.WriteLineAsync($"- Included images: {(includeImages ? "yes" : "no")}");
+                    await writer.WriteLineAsync($"- Included tool calls and results: {(includeToolCallResults ? "yes" : "no")}");
+                    await writer.WriteLineAsync($"- Exported: {DateTimeOffset.Now:O}");
+                    await writer.WriteLineAsync();
+                    await writer.WriteLineAsync("## Transcript");
+                    await writer.WriteLineAsync();
                 }
 
-                var built = BuildTranscriptEntries(evt.Record, transcriptCount, sawFirstUser, htmlImageContext);
-                sawFirstUser = built.SawFirstUserMessage;
-                foreach (var entry in built.Entries.Where(entry => ShouldIncludeTranscriptEntry(entry, includeToolCallResults)))
+                var transcriptCount = 0;
+                var omittedBootstrapMessages = 0;
+                var sawFirstUser = false;
+                await foreach (var evt in StreamJsonlRecordsAsync(sessionFilePath, ExportMaxJsonlLineBytes, true, cancellationToken))
                 {
-                    await writer.WriteLineAsync(RenderHtmlTranscriptEntry(entry));
-                    transcriptCount++;
+                    if (evt.Record is null) continue;
+                    var built = BuildTranscriptEntries(evt.Record, transcriptCount, sawFirstUser, imageContext, includeToolCallResults);
+                    sawFirstUser = built.SawFirstUserMessage;
+                    omittedBootstrapMessages += built.OmittedBootstrapMessages;
+                    foreach (var entry in built.Entries.Where(entry => ShouldIncludeTranscriptEntry(entry, includeToolCallResults)))
+                    {
+                        if (!isHtml && transcriptCount > 0) await writer.WriteLineAsync();
+                        await writer.WriteLineAsync(isHtml ? RenderHtmlTranscriptEntry(entry) : RenderMarkdownTranscriptEntry(entry));
+                        transcriptCount++;
+                    }
+                    ReportByteProgress(progress, evt.BytesProcessed, fileSize, "rendering", 10, 82, $"Rendering {format} transcript...");
                 }
 
-                ReportByteProgress(progress, evt.BytesProcessed, fileSize, "rendering", 10, 82, "Rendering HTML transcript...");
+                if (omittedBootstrapMessages > 0)
+                {
+                    await writer.WriteLineAsync(isHtml
+                        ? $"<p>Omitted bootstrap messages: {omittedBootstrapMessages}</p>"
+                        : $"\n_Omitted bootstrap messages: {omittedBootstrapMessages}_");
+                }
+                if (transcriptCount == 0)
+                {
+                    await writer.WriteLineAsync(isHtml
+                        ? "<p class=\"empty\">No transcript items were found in the response stream.</p>"
+                        : "_No transcript items were found in the response stream._");
+                }
+                if (isHtml) await writer.WriteLineAsync("</main></body></html>");
             }
 
-            if (transcriptCount == 0)
-            {
-                await writer.WriteLineAsync("<p class=\"empty\">No transcript items were found in the response stream.</p>");
-            }
-
-            await writer.WriteLineAsync("</main></body></html>");
+            cancellationToken.ThrowIfCancellationRequested();
+            File.Move(temporaryPath, resolvedOutputPath, overwrite: true);
         }
         catch
         {
-            TryDeleteFile(resolvedOutputPath);
-            htmlImageContext.CleanupAssetDirectory();
+            TryDeleteFile(temporaryPath);
+            if (automaticPath) TryDeleteFile(resolvedOutputPath);
+            imageContext.CleanupAssetDirectory();
             throw;
         }
 
-        progress(new ExportJobStatus("working", 100, "writing", "HTML export ready.", resolvedOutputPath));
         return resolvedOutputPath;
     }
 
@@ -1529,26 +1464,33 @@ public sealed class ClaudeSessionService
         JsonObject record,
         int nextIndex,
         bool sawFirstUserMessage,
-        ExportImageContext? imageContext = null)
+        ExportImageContext? imageContext = null,
+        bool includeToolCallResults = true)
     {
         if (GetString(record, "type") == "response_item")
         {
             return BuildResponseItemTranscriptEntries(record, nextIndex, sawFirstUserMessage, imageContext);
         }
 
-        return BuildClaudeMessageTranscriptEntries(record, nextIndex, sawFirstUserMessage, imageContext);
+        return BuildClaudeMessageTranscriptEntries(record, nextIndex, sawFirstUserMessage, imageContext, includeToolCallResults);
     }
 
     private static TranscriptBuildResult BuildClaudeMessageTranscriptEntries(
         JsonObject record,
         int nextIndex,
         bool sawFirstUserMessage,
-        ExportImageContext? imageContext)
+        ExportImageContext? imageContext,
+        bool includeToolCallResults)
     {
         var message = record["message"] as JsonObject;
         var role = GetString(message, "role");
-        var content = message?["content"] as JsonArray;
-        if (message is null || role is null || content is null)
+        var content = message?["content"] switch
+        {
+            JsonArray array => array,
+            JsonValue value when value.TryGetValue<string>(out var text) => new JsonArray(text),
+            _ => null
+        };
+        if (message is null || role is null or "developer" || content is null)
         {
             return new TranscriptBuildResult([], sawFirstUserMessage, 0);
         }
@@ -1562,9 +1504,12 @@ public sealed class ClaudeSessionService
             entries.Add(new SessionTranscriptEntry(nextIndex + entries.Count, kind, entryRole, timestamp, title, text, language));
         }
 
-        var renderedContent = BuildMessageContent(content, imageContext);
-        if ((!string.IsNullOrWhiteSpace(renderedContent.Text) || renderedContent.HasImages) && role != "developer")
+        var messageParts = new List<JsonNode?>();
+        void FlushMessage()
         {
+            var renderedContent = BuildMessageContent(messageParts, imageContext);
+            messageParts.Clear();
+            if (string.IsNullOrWhiteSpace(renderedContent.Text) && !renderedContent.HasImages) return;
             if (!sawFirstUserMessage && role == "user" && LooksLikeBootstrapContext(renderedContent.Text))
             {
                 sawFirstUserMessage = true;
@@ -1584,12 +1529,14 @@ public sealed class ClaudeSessionService
         foreach (var raw in content)
         {
             var item = raw as JsonObject;
-            if (item is null)
+            var type = GetString(item, "type") ?? "";
+            if (type is not ("thinking" or "tool_use" or "tool_result"))
             {
+                messageParts.Add(raw);
                 continue;
             }
 
-            var type = GetString(item, "type") ?? "";
+            FlushMessage();
             if (type == "thinking")
             {
                 var thinking = GetString(item, "thinking")?.Trim();
@@ -1598,18 +1545,26 @@ public sealed class ClaudeSessionService
                     Push(SessionTranscriptEntryKind.Reasoning, null, "Thinking", thinking, "markdown");
                 }
             }
-            else if (type == "tool_use")
+            else if (type == "tool_use" && includeToolCallResults)
             {
                 var name = GetString(item, "name") ?? "unknown-tool";
-                Push(SessionTranscriptEntryKind.ToolCall, null, $"Tool Call: {name}", PrettyStructuredText(item["input"]), "json");
+                Push(SessionTranscriptEntryKind.ToolCall, null, $"Tool Call: {name}", PrettyStructuredText(item!["input"]), "json");
             }
-            else if (type == "tool_result")
+            else if (type == "tool_result" && includeToolCallResults)
             {
                 var id = GetString(item, "tool_use_id");
-                Push(SessionTranscriptEntryKind.ToolOutput, null, string.IsNullOrWhiteSpace(id) ? "Tool Output" : $"Tool Output ({id})", PrettyStructuredText(item["content"]), "text");
+                var output = item!["content"] is JsonArray parts
+                    ? BuildMessageContent(parts, imageContext)
+                    : new RenderedMessageContent("", PrettyStructuredText(item["content"]), "text", false);
+                if (!output.HasImages && item["content"] is JsonArray)
+                {
+                    output = output with { Body = output.Text, Language = "text" };
+                }
+                Push(SessionTranscriptEntryKind.ToolOutput, null, string.IsNullOrWhiteSpace(id) ? "Tool Output" : $"Tool Output ({id})", output.Body, output.Language);
             }
         }
 
+        FlushMessage();
         return new TranscriptBuildResult(entries, sawFirstUserMessage, omitted);
     }
 
@@ -1730,7 +1685,7 @@ public sealed class ClaudeSessionService
     private static string RenderMarkdownTranscriptEntry(SessionTranscriptEntry entry)
     {
         var timestamp = entry.Timestamp ?? "unknown-time";
-        if (entry.Kind == SessionTranscriptEntryKind.Message)
+        if (entry.Kind == SessionTranscriptEntryKind.Message || (entry.Kind == SessionTranscriptEntryKind.ToolOutput && entry.Language == "markdown"))
         {
             return $"### {timestamp} {entry.Title}\n\n{entry.Text}";
         }
@@ -1744,7 +1699,7 @@ public sealed class ClaudeSessionService
         var roleClass = entry.Kind == SessionTranscriptEntryKind.Message && entry.Role is not null
             ? $"bubble-{HtmlEncoder.Default.Encode(entry.Role)}"
             : entry.Kind == SessionTranscriptEntryKind.Reasoning ? "bubble-reasoning" : "bubble-tool";
-        var body = entry.Language == "html" && entry.Kind == SessionTranscriptEntryKind.Message
+        var body = entry.Language == "html"
             ? entry.Text
             : entry.Language == "markdown" && entry.Kind == SessionTranscriptEntryKind.Message
             ? string.Join("", entry.Text.Split("\n\n").Select(paragraph => $"<p>{HtmlEncoder.Default.Encode(paragraph)}</p>"))
@@ -2221,7 +2176,7 @@ public sealed class ClaudeSessionService
             ? path
             : $"{path}.html";
 
-    private static string CreateAvailableBatchExportPath(
+    private static string CreateAvailableExportPath(
         string outputDirectory,
         string proposedName,
         bool needsExternalAssets,
@@ -2276,69 +2231,48 @@ public sealed class ClaudeSessionService
     private static DateTimeOffset? ParseDate(string? value)
         => DateTimeOffset.TryParse(value, out var parsed) ? parsed : null;
 
-    private static RenderedMessageContent BuildMessageContent(JsonArray content, ExportImageContext? imageContext)
+    private static RenderedMessageContent BuildMessageContent(IEnumerable<JsonNode?> content, ExportImageContext? imageContext)
     {
         var textChunks = new List<string>();
-        var renderedImages = new List<string>();
+        var renderedChunks = new List<string>();
+        var hasImages = false;
+        var isHtml = imageContext?.Mode == ExportImageRenderMode.Html;
+
+        void AddText(string text)
+        {
+            var cleaned = StripImagePlaceholderTags(text);
+            if (string.IsNullOrWhiteSpace(cleaned)) return;
+            textChunks.Add(cleaned);
+            renderedChunks.Add(isHtml
+                ? string.Join("", cleaned.Split("\n\n").Select(paragraph => $"<p>{HtmlEncoder.Default.Encode(paragraph)}</p>"))
+                : cleaned);
+        }
+
         foreach (var item in content)
         {
             if (item is JsonValue value && value.TryGetValue<string>(out var text))
             {
-                textChunks.Add(text);
+                AddText(text);
                 continue;
             }
 
-            var part = item as JsonObject;
-            if (part is null)
-            {
-                continue;
-            }
-
-            if (imageContext is not null && imageContext.IncludeImages && TryRenderImagePart(part, imageContext) is { } renderedImage)
-            {
-                renderedImages.Add(renderedImage);
-                continue;
-            }
-
+            if (item is not JsonObject part) continue;
             if (LooksLikeImageContentPart(part))
             {
+                if (imageContext is not null && imageContext.IncludeImages && TryRenderImagePart(part, imageContext) is { } renderedImage)
+                {
+                    renderedChunks.Add(renderedImage);
+                    hasImages = true;
+                }
                 continue;
             }
 
-            if (GetMessageContentText(part) is { } partText)
-            {
-                textChunks.Add(partText);
-                continue;
-            }
-
-            textChunks.Add(PrettyStructuredText(part));
+            AddText(GetMessageContentText(part) ?? PrettyStructuredText(part));
         }
 
-        var messageText = StripImagePlaceholderTags(string.Join("\n\n", textChunks.Select(chunk => chunk.Trim()).Where(chunk => chunk.Length > 0)));
-        if (imageContext is null)
-        {
-            return new RenderedMessageContent(messageText, messageText, "markdown", false);
-        }
-
-        if (imageContext.Mode == ExportImageRenderMode.Html)
-        {
-            var paragraphs = string.IsNullOrWhiteSpace(messageText)
-                ? ""
-                : string.Join("", messageText.Split("\n\n").Select(paragraph => $"<p>{HtmlEncoder.Default.Encode(paragraph)}</p>"));
-            return new RenderedMessageContent(messageText, paragraphs + string.Join("", renderedImages), "html", renderedImages.Count > 0);
-        }
-
-        var sections = new List<string>();
-        if (!string.IsNullOrWhiteSpace(messageText))
-        {
-            sections.Add(messageText);
-        }
-        if (renderedImages.Count > 0)
-        {
-            sections.Add(string.Join("\n\n", renderedImages));
-        }
-
-        return new RenderedMessageContent(messageText, string.Join("\n\n", sections), "markdown", renderedImages.Count > 0);
+        var messageText = string.Join("\n\n", textChunks);
+        var body = string.Join(isHtml ? "" : "\n\n", renderedChunks);
+        return new RenderedMessageContent(messageText, body, isHtml ? "html" : "markdown", hasImages);
     }
 
     private static string ExtractClaudeTextContent(JsonArray content)
@@ -2411,17 +2345,18 @@ public sealed class ClaudeSessionService
         }
 
         var source = (GetString(part, "image_url") ?? GetString(part, "url"))?.Trim();
+        if (part["source"] is JsonObject nativeSource)
+        {
+            source = GetString(nativeSource, "type") == "base64"
+                ? $"data:{GetString(nativeSource, "media_type")};base64,{GetString(nativeSource, "data")}"
+                : GetString(nativeSource, "url");
+        }
         if (string.IsNullOrWhiteSpace(source))
         {
-            return null;
+            throw new InvalidDataException("Image content has no supported source.");
         }
 
         var reference = context.PersistImageReference(source);
-        if (reference is null)
-        {
-            return null;
-        }
-
         var alt = GetString(part, "alt_text")?.Trim();
         if (string.IsNullOrWhiteSpace(alt))
         {
@@ -2450,7 +2385,8 @@ public sealed class ClaudeSessionService
     private static bool LooksLikeImageContentPart(JsonObject part)
     {
         var type = GetString(part, "type")?.ToLowerInvariant() ?? "";
-        return type.Contains("image", StringComparison.Ordinal) || GetString(part, "image_url") is not null || GetString(part, "url") is not null;
+        return type is "image" or "input_image" or "output_image"
+            || (type.Length == 0 && (GetString(part, "image_url") is not null || GetString(part, "url") is not null));
     }
 
     private static string StripImagePlaceholderTags(string text)
@@ -3051,58 +2987,64 @@ public sealed class ClaudeSessionService
         private List<string> CreatedAssetFiles { get; } = [];
         private bool CreatedAssetDirectory { get; set; }
 
-        public string? PersistImageReference(string source)
+        public string PersistImageReference(string source)
         {
-            if (!source.StartsWith("data:image/", StringComparison.OrdinalIgnoreCase))
+            if (!source.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
             {
-                return source;
-            }
-
-            if (Mode == ExportImageRenderMode.Html && InlineImages)
-            {
-                return source;
+                if (!Uri.TryCreate(source, UriKind.Absolute, out var uri) || uri.Scheme is not ("https" or "http"))
+                {
+                    throw new InvalidDataException("Image URL must use HTTP or HTTPS.");
+                }
+                return uri.AbsoluteUri.Replace("(", "%28").Replace(")", "%29");
             }
 
             var comma = source.IndexOf(',');
-            if (comma < 0)
+            var metadata = comma < 0 ? "" : source[..comma];
+            var mimeType = metadata.Split(';')[0];
+            var extension = mimeType.StartsWith("data:", StringComparison.OrdinalIgnoreCase)
+                ? ExtensionForMimeType(mimeType[5..]) : null;
+            if (extension is null || !metadata.EndsWith(";base64", StringComparison.OrdinalIgnoreCase))
             {
-                return null;
+                throw new InvalidDataException("Image data must use a supported MIME type and base64 encoding.");
             }
 
-            var metadata = source[..comma];
-            var match = System.Text.RegularExpressions.Regex.Match(metadata, "^data:([^;,]+)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-            var extension = ExtensionForMimeType(match.Success ? match.Groups[1].Value : "image/png");
-            if (extension is null)
-            {
-                return null;
-            }
-
+            byte[] bytes;
             try
             {
-                var bytes = Convert.FromBase64String(source[(comma + 1)..]);
-                var directoryExisted = Directory.Exists(AssetDirectoryPath);
-                Directory.CreateDirectory(AssetDirectoryPath);
-                CreatedAssetDirectory |= !directoryExisted;
-                while (true)
-                {
-                    var fileName = $"image-{NextImageIndex:000}.{extension}";
-                    NextImageIndex++;
-                    var filePath = Path.Combine(AssetDirectoryPath, fileName);
-                    try
-                    {
-                        using var stream = new FileStream(filePath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
-                        stream.Write(bytes);
-                        CreatedAssetFiles.Add(filePath);
-                        return $"./{AssetDirectoryName}/{fileName}";
-                    }
-                    catch (IOException) when (File.Exists(filePath))
-                    {
-                    }
-                }
+                bytes = Convert.FromBase64String(source[(comma + 1)..]);
             }
-            catch
+            catch (FormatException ex)
             {
-                return null;
+                throw new InvalidDataException("Image contains invalid base64 data.", ex);
+            }
+
+            if (Mode == ExportImageRenderMode.Html && InlineImages) return source;
+            var directoryExisted = Directory.Exists(AssetDirectoryPath);
+            Directory.CreateDirectory(AssetDirectoryPath);
+            CreatedAssetDirectory |= !directoryExisted;
+            while (true)
+            {
+                var fileName = $"image-{NextImageIndex:000}.{extension}";
+                NextImageIndex++;
+                var filePath = Path.Combine(AssetDirectoryPath, fileName);
+                if (Directory.Exists(filePath)) continue;
+
+                FileStream stream;
+                try
+                {
+                    stream = new FileStream(filePath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+                }
+                catch (IOException) when (File.Exists(filePath) || Directory.Exists(filePath))
+                {
+                    continue;
+                }
+
+                CreatedAssetFiles.Add(filePath);
+                using (stream)
+                {
+                    stream.Write(bytes);
+                }
+                return $"./{Uri.EscapeDataString(AssetDirectoryName)}/{fileName}";
             }
         }
 
