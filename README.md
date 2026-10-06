@@ -106,3 +106,7 @@ Current behavior:
 - Kept batch exports running after individual filename reservation failures and rejected unsupported export formats.
 - Reported image write failures and fixed image asset collisions and links containing spaces or special characters.
 - Updated the Avalonia desktop packages to 12.1.2.
+
+### 1.0.6
+
+- Updated HarfBuzzSharp to 14.2.1.300, SkiaSharp to 4.153.0, and Tmds.DBus.Protocol to 0.95.1, including matching native packages.

@@ -1,5 +1,6 @@
 ﻿using System.Text;
 using System.Reflection;
+using Avalonia;
 using Clodlogs.Desktop.Models;
 using Clodlogs.Desktop.Services;
 
@@ -31,7 +32,8 @@ var tests = new List<(string Name, Func<Task> Run)>
     ("sanitized copy strips response item images", TestSanitizedCopyAsync),
     ("token usage separates cache and calculates costs", TestTokenUsagePricingAsync),
     ("anthropic pricing parser maps cache read and output", TestAnthropicPricingParser),
-    ("token summary exports csv and markdown", TestTokenSummaryExports)
+    ("token summary exports csv and markdown", TestTokenSummaryExports),
+    ("native rendering packages shape text and encode PNG through Avalonia", TestNativeRendering)
 };
 
 var failed = 0;
@@ -50,6 +52,45 @@ foreach (var test in tests)
 }
 
 return failed == 0 ? 0 : 1;
+
+static Task TestNativeRendering()
+{
+    AppBuilder.Configure<Clodlogs.Desktop.App>()
+        .UseStandardRuntimePlatformSubsystem()
+        .UseWindowingSubsystem(() => { }, "Offscreen")
+        .UseSkia()
+        .UseHarfBuzz()
+        .WithInterFont()
+        .SetupWithoutStarting();
+
+    using var bitmap = new Avalonia.Media.Imaging.RenderTargetBitmap(
+        new PixelSize(320, 80), new Vector(96, 96));
+    var text = new Avalonia.Media.FormattedText(
+        "clodlogs – Grüße fi",
+        System.Globalization.CultureInfo.InvariantCulture,
+        Avalonia.Media.FlowDirection.LeftToRight,
+        Avalonia.Media.Typeface.Default,
+        24,
+        Avalonia.Media.Brushes.Black);
+    AssertTrue(text.Width > 0 && text.Height > 0, "native text shaping produces metrics");
+
+    using (var context = bitmap.CreateDrawingContext())
+    {
+        context.DrawRectangle(Avalonia.Media.Brushes.White, null, new Rect(0, 0, 320, 80));
+        context.DrawText(text, new Point(10, 10));
+    }
+
+    using var png = new MemoryStream();
+    bitmap.Save(png, Avalonia.Media.Imaging.PngBitmapEncoderOptions.Default);
+    using var decoded = SkiaSharp.SKBitmap.Decode(png.ToArray());
+    AssertTrue(decoded is not null, "native PNG encoding and decoding succeeds");
+    AssertEqual(320, decoded!.Width, "rendered image width");
+    AssertEqual(80, decoded.Height, "rendered image height");
+    AssertTrue(decoded.Pixels.Any(pixel => pixel.Red < 200 && pixel.Green < 200 && pixel.Blue < 200),
+        "rendered image contains visible text pixels");
+
+    return Task.CompletedTask;
+}
 
 static async Task TestResponseItemTranscriptAsync()
 {
