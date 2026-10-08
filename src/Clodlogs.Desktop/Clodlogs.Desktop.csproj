@@ -18,7 +18,7 @@
     <PackageReference Include="Avalonia.Desktop" Version="12.1.3" />
     <PackageReference Include="Avalonia.Fonts.Inter" Version="12.1.3" />
     <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.3" />
-    <PackageReference Include="HarfBuzzSharp" Version="14.2.1.300" />
+    <PackageReference Include="HarfBuzzSharp" Version="14.2.1.301" />
     <PackageReference Include="HarfBuzzSharp.NativeAssets.Linux" Version="14.2.1.300" />
     <PackageReference Include="HarfBuzzSharp.NativeAssets.WebAssembly" Version="14.2.1.300" />
     <PackageReference Include="SkiaSharp" Version="4.153.0" />
