@@ -110,3 +110,8 @@ Current behavior:
 ### 1.0.6
 
 - Updated HarfBuzzSharp to 14.2.1.300, SkiaSharp to 4.153.0, and Tmds.DBus.Protocol to 0.95.1, including matching native packages.
+
+### 1.0.7 - 2026-10-23
+
+- Updated HarfBuzzSharp and its native packages to 14.2.1.301.
+- Updated SkiaSharp and its native packages to 4.153.1.
