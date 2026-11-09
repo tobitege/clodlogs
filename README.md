@@ -118,5 +118,7 @@ Current behavior:
 
 ### 1.0.8 - 2026-11-09
 
-- Updated the Avalonia desktop packages to 12.1.4.
-- Updated HarfBuzzSharp and its native packages to 14.2.1.400.
+- Updated the Avalonia desktop packages to 12.1.6.
+- Updated HarfBuzzSharp and its native packages to 14.4.0.
+- Updated SkiaSharp and its native packages to 4.155.0.
+- Updated Tmds.DBus.Protocol to 0.95.2.
