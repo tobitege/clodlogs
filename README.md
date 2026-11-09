@@ -115,3 +115,8 @@ Current behavior:
 
 - Updated HarfBuzzSharp and its native packages to 14.2.1.301.
 - Updated SkiaSharp and its native packages to 4.153.1.
+
+### 1.0.8 - 2026-11-09
+
+- Updated the Avalonia desktop packages to 12.1.4.
+- Updated HarfBuzzSharp and its native packages to 14.2.1.400.
