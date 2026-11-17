@@ -1574,6 +1574,16 @@ public sealed partial class ClaudeSessionService
             var renderedContent = BuildMessageContent(messageParts, imageContext);
             messageParts.Clear();
             if (string.IsNullOrWhiteSpace(renderedContent.Text) && !renderedContent.HasImages) return;
+            if (role == "user" && IsClaudeTaskNotification(record, renderedContent.Text))
+            {
+                // Shown and hidden together with the tool calls it belongs to.
+                if (includeToolCallResults)
+                {
+                    Push(SessionTranscriptEntryKind.ToolOutput, null, "Background Task Notification", renderedContent.Text, "text");
+                }
+                return;
+            }
+
             if (!sawFirstUserMessage && role == "user" && LooksLikeBootstrapContext(renderedContent.Text))
             {
                 sawFirstUserMessage = true;
@@ -1885,6 +1895,12 @@ public sealed partial class ClaudeSessionService
             return false;
         }
 
+        // Rows that Claude Code or the host wrote are not prompts of the user.
+        if (GetBoolean(record, "isMeta") || GetBoolean(record, "isCompactSummary") || IsClaudeHostTurn(record))
+        {
+            return false;
+        }
+
         // Claude Code writes a typed prompt either as plain text or as a list of content blocks.
         var text = message?["content"] switch
         {
@@ -1892,7 +1908,7 @@ public sealed partial class ClaudeSessionService
             JsonValue value when value.TryGetValue<string>(out var plainText) => plainText,
             _ => ""
         };
-        return !string.IsNullOrWhiteSpace(text) && !LooksLikeBootstrapContext(text);
+        return !string.IsNullOrWhiteSpace(text) && !LooksLikeBootstrapContext(text) && !IsClaudeTaskNotification(record, text);
     }
 
     private static int CountClaudeToolUses(JsonObject record)

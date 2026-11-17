@@ -20,6 +20,7 @@ var tests = new List<(string Name, Func<Task> Run)>
     ("opencode export marks interrupted and failed turns, injected text and compaction", TestOpenCodeExportTurnsAsync),
     ("opencode export embeds only valid inline images", TestOpenCodeExportImagesAsync),
     ("opencode batch export names files and repeats identifiers", TestOpenCodeBatchExportAsync),
+    ("task notifications follow the tool option and are not prompts", TestTaskNotificationsAsync),
     ("opencode identifiers follow the layout of OpenCode 2.3", TestOpenCodeIdentifiers),
     ("single export avoids automatic filename collisions", TestSingleExportCollisionsAsync),
     ("failed export preserves existing output and reports image I/O errors", TestFailedExportPreservesOutputAsync),
@@ -666,6 +667,58 @@ static Task TestOpenCodeIdentifiers()
     AssertTrue(System.Text.RegularExpressions.Regex.IsMatch(session, "^ses_e18a6cda6ffe[0-9A-Za-z]{14}$"), $"session identifier layout: {session}");
     AssertTrue(message != ClaudeSessionService.BuildOpenCodeIdentifier("msg", 1794882744955, 1, false, "other"), "the seed decides the suffix");
     return Task.CompletedTask;
+}
+
+static async Task TestTaskNotificationsAsync()
+{
+    using var fixture = new TempFixture();
+    // Claude Code writes a finished background task, a host event and its own additions as user rows.
+    var sessionPath = fixture.WriteSession("""
+        {"type":"user","sessionId":"notify","cwd":"C:\\repo","timestamp":"2026-11-17T10:00:01Z","origin":{"kind":"human"},"turnOrigin":"human","message":{"role":"user","content":"Start the build"}}
+        {"type":"assistant","timestamp":"2026-11-17T10:00:02Z","message":{"id":"msg_a","role":"assistant","model":"claude-test","stop_reason":"end_turn","content":[{"type":"text","text":"Started in the background."}]}}
+        {"type":"user","timestamp":"2026-11-17T10:00:03Z","origin":{"kind":"task-notification"},"promptSource":"system","turnOrigin":"task_notification","message":{"role":"user","content":"<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n<summary>NOTIFY-MARKER</summary>\n</task-notification>"}}
+        {"type":"assistant","timestamp":"2026-11-17T10:00:04Z","message":{"id":"msg_b","role":"assistant","model":"claude-test","stop_reason":"end_turn","content":[{"type":"text","text":"The build finished."}]}}
+        {"type":"user","timestamp":"2026-11-17T10:00:05Z","promptSource":"sdk","turnOrigin":"auto_continuation","message":{"role":"user","content":"<ci-monitor-event>CI-MARKER</ci-monitor-event>"}}
+        {"type":"assistant","timestamp":"2026-11-17T10:00:06Z","message":{"id":"msg_c","role":"assistant","model":"claude-test","stop_reason":"end_turn","content":[{"type":"text","text":"CI is green."}]}}
+        {"type":"user","isMeta":true,"timestamp":"2026-11-17T10:00:07Z","message":{"role":"user","content":"META-MARKER"}}
+        {"type":"user","timestamp":"2026-11-17T10:00:08Z","message":{"role":"user","content":"<task-notification>\n<summary>OLD-NOTIFY-MARKER</summary>\n</task-notification>"}}
+        """);
+    var service = new ClaudeSessionService();
+
+    var metrics = await service.GetSessionDetailMetricsAsync(sessionPath, false);
+    AssertEqual(1, metrics.InteractionCount, "only the typed prompt counts as a prompt");
+
+    var transcript = await service.ReadSessionTranscriptAsync(sessionPath);
+    var notification = transcript.Entries.Single(entry => entry.Text.Contains("NOTIFY-MARKER", StringComparison.Ordinal) && !entry.Text.Contains("OLD-", StringComparison.Ordinal));
+    AssertEqual(SessionTranscriptEntryKind.ToolOutput, notification.Kind, "the replay hides a task notification together with the tool calls");
+    AssertEqual("Background Task Notification", notification.Title, "task notification title");
+
+    foreach (var format in new[] { "markdown", "html" })
+    foreach (var includeTools in new[] { false, true })
+    {
+        var job = service.StartExportJob(format, sessionPath, false, false, includeTools, Path.Combine(fixture.Root, $"{format}-{includeTools}"), null);
+        var status = await WaitForExportAsync(() => service.GetExportJobStatus(job.JobId));
+        AssertEqual("success", status.Kind, $"{format} export");
+        var exported = await File.ReadAllTextAsync(status.OutputPath!);
+        foreach (var marker in new[] { "NOTIFY-MARKER", "OLD-NOTIFY-MARKER", "Background Task Notification" })
+        {
+            AssertEqual(includeTools, exported.Contains(marker, StringComparison.Ordinal), $"{format}, tools={includeTools}: {marker}");
+        }
+        AssertContains("The build finished.", exported, "the answer to a notification stays");
+    }
+
+    string MessageTypes(JsonObject data) => string.Join(",", ((JsonArray)data["messages"]!).Select(message => message!["type"]!.GetValue<string>()));
+    var withoutTools = await ExportOpenCodeAsync(sessionPath, Path.Combine(fixture.Root, "opencode-plain"), includeImages: false, includeTools: false);
+    AssertEqual("user,assistant,idle,assistant,idle,synthetic,assistant,synthetic,idle", MessageTypes(withoutTools), "message types without tool calls");
+    AssertTrue(!withoutTools.ToJsonString().Contains("NOTIFY-MARKER", StringComparison.Ordinal), "task notifications are left out without tool calls");
+    AssertContains("CI-MARKER", withoutTools.ToJsonString(), "a host event is kept as injected text");
+
+    var withTools = await ExportOpenCodeAsync(sessionPath, Path.Combine(fixture.Root, "opencode-tools"), includeImages: false, includeTools: true);
+    AssertEqual("user,assistant,idle,synthetic,assistant,idle,synthetic,assistant,synthetic,idle,synthetic,idle", MessageTypes(withTools), "message types with tool calls");
+    // The last notification has no answer; that does not turn the finished session into an interrupted one.
+    AssertEqual("succeeded", withTools["info"]!["outcome"]!.GetValue<string>(), "outcome after a trailing notification");
+    AssertEqual(1, ((JsonArray)withTools["messages"]!).Count(message => message!["type"]!.GetValue<string>() == "user"), "only the typed prompt is a user message");
+    AssertEqual(OpenCodeTime(2), withTools["messages"]![2]!["time"]!["created"]!.GetValue<long>(), "the turn before a notification ends with its last response");
 }
 
 static async Task TestSingleExportCollisionsAsync()

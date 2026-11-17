@@ -42,6 +42,15 @@ public sealed partial class ClaudeSessionService
     private static bool IsClaudeTranscriptRecord(JsonObject record)
         => GetString(record, "type") is null or "user" or "assistant";
 
+    // Claude Code reports a finished background task or subagent as a user row. It is the late result of a tool call.
+    private static bool IsClaudeTaskNotification(JsonObject record, string text)
+        => GetString(record["origin"] as JsonObject, "kind") == "task-notification"
+            || text.TrimStart().StartsWith("<task-notification>", StringComparison.Ordinal);
+
+    // A user row that the host wrote to start a turn, such as a CI event, not something the user typed.
+    private static bool IsClaudeHostTurn(JsonObject record)
+        => GetString(record, "turnOrigin") is "auto_continuation" or "host_synthetic";
+
     private static bool GetBoolean(JsonObject? obj, string property)
         => obj is not null
             && obj.TryGetPropertyValue(property, out var node)
@@ -92,6 +101,7 @@ public sealed partial class ClaudeSessionService
 
         private int _messagesSinceIdle;
         private bool _assistantSinceIdle;
+        private bool _promptSinceIdle;
         private long? _lastIdleMs;
         private string? _lastOutcome;
 
@@ -136,7 +146,10 @@ public sealed partial class ClaudeSessionService
                 null or "tool_use" or "pause_turn" => "interrupted",
                 _ => "failed"
             };
-            EndTurn(_lastActivityMs ?? timestampMs, _assistantSinceIdle ? outcome : "interrupted");
+            // A prompt without an answer was cut off; injected text without an answer changes nothing.
+            EndTurn(
+                _lastActivityMs ?? timestampMs,
+                _assistantSinceIdle ? outcome : _promptSinceIdle ? "interrupted" : _lastOutcome ?? "succeeded");
             return (Flush(), BuildInfo());
         }
 
@@ -287,6 +300,27 @@ public sealed partial class ClaudeSessionService
                 return;
             }
 
+            var taskNotification = IsClaudeTaskNotification(record, promptText);
+            if (taskNotification || IsClaudeHostTurn(record))
+            {
+                // Such a row starts a turn of its own once the previous response has finished.
+                if (_assistantSinceIdle && _stepStopReason is not (null or "tool_use" or "pause_turn"))
+                {
+                    EndTurn(previousActivityMs, _stepIsApiError ? "failed" : "succeeded");
+                }
+                else
+                {
+                    CloseStep();
+                }
+
+                // A task notification follows the option for tool calls, like the tool result it stands for.
+                if (promptText.Length > 0 && (!taskNotification || includeToolCallResults))
+                {
+                    Enqueue(NewMessage("synthetic", timestampMs, message => message["text"] = promptText));
+                }
+                return;
+            }
+
             if (!_sawFirstUserMessage && LooksLikeBootstrapContext(promptText))
             {
                 _sawFirstUserMessage = true;
@@ -307,6 +341,7 @@ public sealed partial class ClaudeSessionService
             }
 
             _firstPromptText ??= NonBlank(promptText);
+            _promptSinceIdle = true;
             Enqueue(NewMessage("user", timestampMs, message =>
             {
                 message["text"] = promptText;
@@ -505,6 +540,7 @@ public sealed partial class ClaudeSessionService
             // A tool result cannot arrive after its turn ended.
             FailOpenCalls(timestampMs);
             _assistantSinceIdle = false;
+            _promptSinceIdle = false;
             _stepStopReason = null;
             _stepIsApiError = false;
             if (_messagesSinceIdle == 0)

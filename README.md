@@ -99,7 +99,8 @@ What the file contains:
 - each model response as an assistant message with its thinking and text, under the Claude model name and the provider `anthropic`, with its token counts
 - with `Include tool calls and tool outputs`, each tool call with its input and result; a failed call keeps its error, and a call without a recorded result is marked as failed
 - an idle marker at the end of each turn, with the outcome `succeeded`, `failed` or `interrupted`
-- text that Claude Code added for the model, such as command caveats, as a synthetic message
+- text that Claude Code added for the model, such as command caveats or host events, as a synthetic message
+- with `Include tool calls and tool outputs`, each notification about a finished background task as a synthetic message; without the option these notifications are left out, like the tool calls they belong to
 - a compaction summary where Claude Code compacted the conversation
 - the session title (the custom title, else the generated title, else the first prompt), the start time and the token totals
 
@@ -161,3 +162,4 @@ Notes:
 - Session files are now scanned on several threads. A history of about 1,100 files (6.6 GB) loads in about 7 seconds instead of about a minute.
 - Fixed the session list showing the session id for a session that the user named. A title set by the user now wins over the generated title.
 - Fixed the prompt count leaving out prompts that Claude Code stores as plain text, which showed `0 prompts` for such sessions.
+- A notification about a finished background task is no longer treated as a prompt of the user. In the replay and in every export format it now belongs to the tool calls: it is shown as `Background Task Notification` with them and left out without them. Such notifications and other rows that Claude Code or the host wrote no longer count as prompts.
