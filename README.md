@@ -182,3 +182,5 @@ Notes:
 - The OpenCode export leaves out what only served Claude Code's own interface: interruption markers, commands that Claude Code ran itself (such as `/model`) with their output, the placeholder answer `No response requested.`, the messages of failed API requests, notes with the temporary path of a pasted image and resume markers. Interrupted and failed turns keep their outcome in the idle marker.
 - In the OpenCode export, the text of a loaded skill, the expansion of a slash command, notes about the scale of a screenshot and messages from other sessions now follow the option for tool calls. A slash command of the user is written as typed, a reminder in front of a typed prompt becomes injected text, and the references of the tool search become one line.
 - Fixed the prompt count including interruption markers, commands that Claude Code ran itself with their output, reminders of the host without a prompt and the prompts of subagents.
+- Updated SkiaSharp and its native packages to 4.156.0.
+- Updated HarfBuzzSharp and its native packages to 14.4.0.100.
