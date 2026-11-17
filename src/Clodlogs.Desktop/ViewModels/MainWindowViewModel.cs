@@ -515,7 +515,7 @@ public sealed class MainWindowViewModel : ViewModelBase
 
     public bool ExportFormatHintVisible => ExportFormat == ClaudeSessionService.OpenCodeExportFormat;
     public string ExportFormatHint => ExportFormatHintVisible
-        ? "Writes a session file for OpenCode 2. Import it there with: opencode session import <file>. Images are embedded in the file. Include tool calls when the session is meant to be continued."
+        ? "Writes a session file for OpenCode 2. To import it in OpenCode, open the ⋯ menu of a project in the sidebar and choose Import session, or run: opencode session import <file>. Images are embedded in the file. Include tool calls when the session is meant to be continued."
         : "";
 
     public string BatchExportDirectory

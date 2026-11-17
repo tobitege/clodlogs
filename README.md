@@ -86,13 +86,12 @@ Current behavior:
 
 ## OpenCode Session Export
 
-clodlogs can write a Claude session as a session file for [OpenCode](https://opencode.ai/) 2, so the conversation can be read and continued there. Choose `opencode` as the format in the export dialog or in the batch export, then import the file:
+clodlogs can write a Claude session as a session file for [OpenCode](https://opencode.ai/) 2, so the conversation can be read and continued there. Choose `opencode` as the format in the export dialog or in the batch export. The file is named `<session>.opencode.json`.
 
-```powershell
-opencode session import C:\exports\5e1a9c2e-087b-49a4-9f20-b4ac51bc2a27.opencode.json --directory C:\github\myproject
-```
+Import the file in OpenCode in one of two ways:
 
-The file is named `<session>.opencode.json`. OpenCode attaches the imported session to the project of `--directory`, or of the current folder without it.
+- In the OpenCode desktop app: in the sidebar under `Projects`, open the `⋯` menu (`More options`) of the project the session should belong to, choose `Import session` and pick the file.
+- On the command line: `opencode session import <file> --directory <project folder>`. OpenCode attaches the session to the project of `--directory`, or of the current folder without it. With only the desktop app installed, `opencode` is not on the PATH; on Windows its command line program is `%LOCALAPPDATA%\Programs\ai.opencode.desktop\resources\opencode-cli.exe`.
 
 What the file contains:
 
