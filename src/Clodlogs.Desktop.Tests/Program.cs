@@ -1,8 +1,10 @@
 ﻿using System.Text;
 using System.Reflection;
+using System.Text.Json.Nodes;
 using Avalonia;
 using Clodlogs.Desktop.Models;
 using Clodlogs.Desktop.Services;
+using Clodlogs.Desktop.ViewModels;
 
 var tests = new List<(string Name, Func<Task> Run)>
 {
@@ -12,6 +14,13 @@ var tests = new List<(string Name, Func<Task> Run)>
     ("native Claude export honors tool options without duplicates", TestNativeClaudeToolOptionsAsync),
     ("native Claude transcript preserves block order and string messages", TestNativeClaudeTranscriptAsync),
     ("native Claude images honor image and tool options", TestNativeClaudeImageOptionsAsync),
+    ("api request rows stay out of transcripts, exports and tool counts", TestApiRequestRowsAreNotTranscriptAsync),
+    ("opencode export maps prompts, responses, tool calls and turn ends", TestOpenCodeExportTranscriptAsync),
+    ("opencode export leaves out images and tool calls unless requested", TestOpenCodeExportOptionsAsync),
+    ("opencode export marks interrupted and failed turns, injected text and compaction", TestOpenCodeExportTurnsAsync),
+    ("opencode export embeds only valid inline images", TestOpenCodeExportImagesAsync),
+    ("opencode batch export names files and repeats identifiers", TestOpenCodeBatchExportAsync),
+    ("opencode identifiers follow the layout of OpenCode 2.3", TestOpenCodeIdentifiers),
     ("single export avoids automatic filename collisions", TestSingleExportCollisionsAsync),
     ("failed export preserves existing output and reports image I/O errors", TestFailedExportPreservesOutputAsync),
     ("image asset names and links handle collisions and special characters", TestImageAssetLinksAsync),
@@ -33,6 +42,10 @@ var tests = new List<(string Name, Func<Task> Run)>
     ("token usage separates cache and calculates costs", TestTokenUsagePricingAsync),
     ("anthropic pricing parser maps cache read and output", TestAnthropicPricingParser),
     ("token summary exports csv and markdown", TestTokenSummaryExports),
+    ("session scan reads many files and keeps every session", TestParallelSessionScanAsync),
+    ("session list prefers the title set by the user", TestSessionTitlesAsync),
+    ("refresh scan reports progress and clears stale results", TestRefreshScanReportsProgressAsync),
+    // Keep this one last: it installs Avalonia's synchronization context, which no message loop serves here.
     ("native rendering packages shape text and encode PNG through Avalonia", TestNativeRendering)
 };
 
@@ -327,6 +340,332 @@ static async Task TestNativeClaudeImageOptionsAsync()
             AssertTrue(!exported.Contains("aGVsbG8=", StringComparison.Ordinal) && !exported.Contains("d29ybGQ=", StringComparison.Ordinal), "excluded image data never leaks");
         }
     }
+}
+
+static async Task TestApiRequestRowsAreNotTranscriptAsync()
+{
+    using var fixture = new TempFixture();
+    // Claude Code also logs the API requests it sends; those rows repeat the conversation and the system prompt.
+    var sessionPath = fixture.WriteSession("""
+        {"type":"user","sessionId":"native-session","cwd":"C:\\repo","timestamp":"2026-09-14T10:00:00Z","message":{"role":"user","content":"STRING-USER"}}
+        {"type":"assistant","timestamp":"2026-09-14T10:00:01Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"shell","input":{"command":"TOOL-INPUT-MARKER"}}]}}
+        {"type":"api-request-blob","sessionId":"native-session","hash":"a","message":{"role":"system","content":[{"type":"text","text":"SYSTEM-BLOB-MARKER"}]}}
+        {"type":"api-request-blob","sessionId":"native-session","hash":"b","message":{"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"shell","input":{"command":"TOOL-INPUT-MARKER"}}]}}
+        {"type":"api-request-blob","sessionId":"native-session","hash":"c","message":{"role":"user","content":"STRING-USER"}}
+        {"type":"ai-title","sessionId":"native-session","aiTitle":"Session title"}
+        """);
+    var service = new ClaudeSessionService();
+
+    var transcript = await service.ReadSessionTranscriptAsync(sessionPath);
+    AssertEqual(2, transcript.Entries.Count, "transcript holds only conversation rows");
+    var metrics = await service.GetSessionDetailMetricsAsync(sessionPath, false);
+    AssertEqual(1, metrics.ToolCallCount, "tool calls are counted once");
+    AssertEqual(1, metrics.InteractionCount, "a prompt written as plain text is counted, and counted once");
+
+    foreach (var format in new[] { "markdown", "html", "opencode" })
+    {
+        var job = service.StartExportJob(format, sessionPath, false, false, true, Path.Combine(fixture.Root, format), null);
+        var status = await WaitForExportAsync(() => service.GetExportJobStatus(job.JobId));
+        AssertEqual("success", status.Kind, $"{format} export");
+        var exported = await File.ReadAllTextAsync(status.OutputPath!);
+        AssertTrue(!exported.Contains("SYSTEM-BLOB-MARKER", StringComparison.Ordinal), $"{format}: system prompt of an API request is not exported");
+        AssertEqual(1, exported.Split("STRING-USER").Length - 1, $"{format}: prompt appears once");
+        AssertEqual(1, exported.Split("TOOL-INPUT-MARKER").Length - 1, $"{format}: tool call appears once");
+    }
+}
+
+static long OpenCodeTime(int seconds)
+    => new DateTimeOffset(2026, 11, 17, 10, 0, seconds, TimeSpan.Zero).ToUnixTimeMilliseconds();
+
+// Fills @tN@ with the test time of second N and @model@ with the model reference.
+static string OpenCodeJson(string template)
+    => System.Text.RegularExpressions.Regex.Replace(template, "@t(\\d+)@", match => OpenCodeTime(int.Parse(match.Groups[1].Value)).ToString(System.Globalization.CultureInfo.InvariantCulture))
+        .Replace("@model@", """{"id":"claude-test","providerID":"anthropic"}""");
+
+static string WriteOpenCodeSourceSession(TempFixture fixture)
+{
+    const string usage = """
+        "usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":40}
+        """;
+    const string image = """
+        {"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}}
+        """;
+    return fixture.WriteSession(OpenCodeJson("""
+        {"type":"user","sessionId":"claude-session-1","cwd":"C:\\repo","version":"2.9.1","timestamp":"2026-11-17T10:00:02Z","message":{"role":"user","content":[{"type":"text","text":"Fix the bug"},@image@]}}
+        {"type":"assistant","timestamp":"2026-11-17T10:00:03Z","message":{"id":"msg_a","role":"assistant","model":"claude-test","stop_reason":"tool_use",@usage@,"content":[{"type":"thinking","thinking":"Plan the fix"}]}}
+        {"type":"assistant","timestamp":"2026-11-17T10:00:04Z","message":{"id":"msg_a","role":"assistant","model":"claude-test","stop_reason":"tool_use",@usage@,"content":[{"type":"text","text":"Looking at the file."}]}}
+        {"type":"assistant","timestamp":"2026-11-17T10:00:05Z","message":{"id":"msg_a","role":"assistant","model":"claude-test","stop_reason":"tool_use",@usage@,"content":[{"type":"tool_use","id":"call_1","name":"Bash","input":{"command":"ls"}}]}}
+        {"type":"user","timestamp":"2026-11-17T10:00:06Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"file.txt"}]}}
+        {"type":"assistant","timestamp":"2026-11-17T10:00:07Z","message":{"id":"msg_a","role":"assistant","model":"claude-test","stop_reason":"tool_use",@usage@,"content":[{"type":"tool_use","id":"call_2","name":"Read","input":{"file_path":"file.txt"}}]}}
+        {"type":"user","timestamp":"2026-11-17T10:00:08Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_2","is_error":true,"content":[{"type":"text","text":"File not found"},@image@]}]}}
+        {"type":"assistant","timestamp":"2026-11-17T10:00:09Z","message":{"id":"msg_b","role":"assistant","model":"claude-test","stop_reason":"end_turn","usage":{"input_tokens":1,"cache_read_input_tokens":2,"output_tokens":3},"content":[{"type":"text","text":"Fixed."}]}}
+        {"type":"ai-title","sessionId":"claude-session-1","aiTitle":"Fix a bug"}
+        {"type":"custom-title","sessionId":"claude-session-1","customTitle":"Bug fix session"}
+        """)
+        .Replace("@usage@", usage.Trim())
+        .Replace("@image@", image.Trim()));
+}
+
+static async Task<JsonObject> ExportOpenCodeAsync(string sessionPath, string outputDirectory, bool includeImages, bool includeTools)
+{
+    var service = new ClaudeSessionService();
+    var job = service.StartExportJob("opencode", sessionPath, includeImages, false, includeTools, outputDirectory, null);
+    var status = await WaitForExportAsync(() => service.GetExportJobStatus(job.JobId));
+    AssertEqual("success", status.Kind, $"opencode export: {status.Message}");
+    AssertTrue(status.OutputPath!.EndsWith(".opencode.json", StringComparison.Ordinal), "opencode export file suffix");
+    AssertContains("OpenCode session file written to", status.Message, "opencode export message");
+    var data = (JsonObject)JsonNode.Parse(await File.ReadAllTextAsync(status.OutputPath))!;
+    AssertOpenCodeImportable(data);
+    return data;
+}
+
+// Mirrors what the OpenCode 2.3 importer requires of SessionTransfer.Data.
+static void AssertOpenCodeImportable(JsonObject data)
+{
+    static bool IsTime(JsonNode? node) => node is JsonValue value && value.TryGetValue<long>(out var time) && time >= 0;
+    static bool IsText(JsonNode? node) => node is JsonValue value && value.TryGetValue<string>(out _);
+    static bool Matches(JsonNode? node, string pattern)
+        => node is JsonValue value && value.TryGetValue<string>(out var text) && System.Text.RegularExpressions.Regex.IsMatch(text, pattern);
+
+    AssertEqual("info,messages", string.Join(",", data.Select(pair => pair.Key).Order()), "top-level keys");
+    var info = (JsonObject)data["info"]!;
+    AssertTrue(Matches(info["id"], "^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$"), "session id layout");
+    AssertTrue(IsText(info["projectID"]) && IsText(info["location"]!["directory"]) && IsText(info["title"]), "session info texts");
+    AssertTrue(IsTime(info["time"]!["created"]) && IsTime(info["time"]!["updated"]), "session times");
+    foreach (var count in new[] { info["cost"], info["tokens"]!["input"], info["tokens"]!["output"], info["tokens"]!["reasoning"], info["tokens"]!["cache"]!["read"], info["tokens"]!["cache"]!["write"] })
+    {
+        AssertTrue(IsTime(count), "session counts are numbers");
+    }
+
+    var ids = new List<string>();
+    foreach (var message in ((JsonArray)data["messages"]!).Cast<JsonObject>())
+    {
+        AssertTrue(Matches(message["id"], "^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$"), "message id layout");
+        ids.Add(message["id"]!.GetValue<string>());
+        AssertTrue(IsTime(message["time"]!["created"]), "message time");
+        switch (message["type"]!.GetValue<string>())
+        {
+            case "user":
+                AssertTrue(IsText(message["text"]), "user text");
+                foreach (var file in (message["files"] as JsonArray ?? new JsonArray()).Cast<JsonObject>())
+                {
+                    AssertTrue(Matches(file["data"], "^[A-Za-z0-9+/]*={0,2}$") && file["data"]!.GetValue<string>().Length % 4 == 0, "attachment is padded base64");
+                    AssertTrue(IsText(file["mime"]) && file["source"]!["type"]!.GetValue<string>() == "inline", "attachment source");
+                }
+                break;
+            case "assistant":
+                AssertTrue(IsText(message["agent"]) && IsText(message["model"]!["id"]) && IsText(message["model"]!["providerID"]), "assistant agent and model");
+                // The importer drops an assistant message that has no completion time.
+                AssertTrue(IsTime(message["time"]!["completed"]), "assistant completion time");
+                AssertTrue(Matches(message["finish"], "^(stop|length|tool-calls|content-filter|error|unknown)$"), "assistant finish reason");
+                AssertTrue(((JsonArray)message["content"]!).Count > 0, "assistant message has content");
+                foreach (var part in ((JsonArray)message["content"]!).Cast<JsonObject>())
+                {
+                    if (part["type"]!.GetValue<string>() != "tool")
+                    {
+                        AssertTrue(Matches(part["type"], "^(text|reasoning)$") && IsText(part["text"]), "text part");
+                        continue;
+                    }
+
+                    AssertTrue(IsText(part["id"]) && IsText(part["name"]) && IsTime(part["time"]!["created"]), "tool part");
+                    var state = (JsonObject)part["state"]!;
+                    AssertTrue(state["input"] is JsonObject, "tool input is an object");
+                    if (state["status"]!.GetValue<string>() == "completed")
+                    {
+                        AssertTrue(((JsonArray)state["content"]!).Count > 0, "completed tool call has content");
+                    }
+                    else
+                    {
+                        AssertEqual("error", state["status"]!.GetValue<string>(), "tool state");
+                        AssertTrue(IsText(state["error"]!["type"]) && IsText(state["error"]!["message"]), "tool error");
+                        AssertTrue(state["content"] is null or JsonArray { Count: > 0 }, "tool error content is absent or filled");
+                    }
+                }
+                break;
+            case "synthetic":
+                AssertTrue(IsText(message["text"]), "synthetic text");
+                break;
+            case "compaction":
+                AssertEqual("completed", message["status"]!.GetValue<string>(), "compaction status");
+                AssertTrue(Matches(message["reason"], "^(auto|manual)$") && IsText(message["summary"]), "compaction fields");
+                break;
+            case "idle":
+                AssertTrue(Matches(message["outcome"], "^(succeeded|failed|interrupted)$"), "idle outcome");
+                break;
+            default:
+                throw new InvalidOperationException($"unexpected message type {message["type"]}");
+        }
+    }
+
+    AssertEqual(ids.Count, ids.Distinct().Count(), "message ids are unique");
+    AssertTrue(ids.SequenceEqual(ids.Order(StringComparer.Ordinal)), "message ids ascend");
+}
+
+static void AssertJsonEqual(string expectedJson, JsonNode? actual, string label)
+{
+    var expected = JsonNode.Parse(expectedJson);
+    if (!JsonNode.DeepEquals(expected, actual))
+    {
+        throw new InvalidOperationException($"{label}: expected {expected?.ToJsonString()}, got {actual?.ToJsonString()}");
+    }
+}
+
+static JsonArray OpenCodeMessagesWithoutIds(JsonObject data)
+{
+    var messages = (JsonArray)data["messages"]!.DeepClone();
+    foreach (var message in messages.Cast<JsonObject>())
+    {
+        message.Remove("id");
+    }
+    return messages;
+}
+
+static async Task TestOpenCodeExportTranscriptAsync()
+{
+    using var fixture = new TempFixture();
+    var data = await ExportOpenCodeAsync(WriteOpenCodeSourceSession(fixture), fixture.Root, includeImages: true, includeTools: true);
+
+    AssertJsonEqual(OpenCodeJson("""
+        [
+          {"type":"user","time":{"created":@t2@},"text":"Fix the bug",
+           "files":[{"data":"iVBORw0KGgo=","mime":"image/png","source":{"type":"inline"},"name":"image-001.png"}]},
+          {"type":"assistant","time":{"created":@t3@,"completed":@t8@},"agent":"build","model":@model@,
+           "content":[
+             {"type":"reasoning","text":"Plan the fix"},
+             {"type":"text","text":"Looking at the file."},
+             {"type":"tool","id":"call_1","name":"Bash",
+              "state":{"status":"completed","input":{"command":"ls"},"content":[{"type":"text","text":"file.txt"}]},
+              "time":{"created":@t5@,"ran":@t5@,"completed":@t6@}},
+             {"type":"tool","id":"call_2","name":"Read",
+              "state":{"status":"error","input":{"file_path":"file.txt"},"error":{"type":"tool.execution","message":"File not found"},
+                       "content":[{"type":"text","text":"File not found"},{"type":"file","uri":"data:image/png;base64,iVBORw0KGgo=","mime":"image/png","name":"image-002.png"}]},
+              "time":{"created":@t7@,"ran":@t7@,"completed":@t8@}}
+           ],
+           "finish":"tool-calls","tokens":{"input":10,"output":40,"reasoning":0,"cache":{"read":30,"write":20}}},
+          {"type":"assistant","time":{"created":@t9@,"completed":@t9@},"agent":"build","model":@model@,
+           "content":[{"type":"text","text":"Fixed."}],
+           "finish":"stop","tokens":{"input":1,"output":3,"reasoning":0,"cache":{"read":2,"write":0}}},
+          {"type":"idle","time":{"created":@t9@},"outcome":"succeeded"}
+        ]
+        """), OpenCodeMessagesWithoutIds(data), "opencode messages");
+
+    var info = (JsonObject)data["info"]!.DeepClone();
+    info.Remove("id");
+    AssertJsonEqual(OpenCodeJson("""
+        {"projectID":"global","model":@model@,"cost":0,
+         "tokens":{"input":11,"output":43,"reasoning":0,"cache":{"read":32,"write":20}},
+         "outcome":"succeeded",
+         "time":{"created":@t2@,"updated":@t9@,"idle":@t9@,"viewed":@t9@},
+         "title":"Bug fix session","location":{"directory":"C:\\repo"},
+         "metadata":{"source":"claude-code","claudeSessionId":"claude-session-1","claudeCodeVersion":"2.9.1","exportedBy":"clodlogs"}}
+        """), info, "opencode session info");
+}
+
+static async Task TestOpenCodeExportOptionsAsync()
+{
+    using var fixture = new TempFixture();
+    var data = await ExportOpenCodeAsync(WriteOpenCodeSourceSession(fixture), fixture.Root, includeImages: false, includeTools: false);
+    var exported = data.ToJsonString();
+
+    AssertTrue(!exported.Contains("iVBORw0KGgo=", StringComparison.Ordinal), "excluded image data never leaks");
+    AssertTrue(!exported.Contains("call_1", StringComparison.Ordinal) && !exported.Contains("file.txt", StringComparison.Ordinal), "excluded tool calls and results never leak");
+    var messages = (JsonArray)data["messages"]!;
+    AssertEqual("user,assistant,assistant,idle", string.Join(",", messages.Select(message => message!["type"]!.GetValue<string>())), "message types without tools");
+    AssertTrue(messages[0]!["files"] is null, "prompt has no attachments");
+    AssertEqual("reasoning,text", string.Join(",", ((JsonArray)messages[1]!["content"]!).Select(part => part!["type"]!.GetValue<string>())), "response keeps reasoning and text");
+    // The token totals do not depend on the options.
+    AssertEqual(43L, data["info"]!["tokens"]!["output"]!.GetValue<long>(), "output tokens");
+}
+
+static async Task TestOpenCodeExportTurnsAsync()
+{
+    using var fixture = new TempFixture();
+    var sessionPath = fixture.WriteSession("""
+        {"type":"user","sessionId":"claude-session-2","cwd":"C:\\repo","timestamp":"2026-11-17T10:00:01Z","message":{"role":"user","content":"First\nprompt"}}
+        {"type":"assistant","timestamp":"2026-11-17T10:00:02Z","message":{"id":"msg_a","role":"assistant","model":"claude-test","stop_reason":"tool_use","content":[{"type":"tool_use","id":"call_1","name":"Bash","input":"not an object"}]}}
+        {"type":"assistant","isSidechain":true,"timestamp":"2026-11-17T10:00:02Z","message":{"id":"msg_side","role":"assistant","model":"claude-test","content":[{"type":"text","text":"SIDECHAIN"}]}}
+        {"type":"user","timestamp":"2026-11-17T10:00:03Z","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}}
+        {"type":"user","isMeta":true,"timestamp":"2026-11-17T10:00:04Z","message":{"role":"user","content":"<local-command-caveat>Caveat</local-command-caveat>"}}
+        {"type":"system","subtype":"compact_boundary","timestamp":"2026-11-17T10:00:05Z","compactMetadata":{"trigger":"manual"},"content":"Conversation compacted"}
+        {"type":"user","isCompactSummary":true,"timestamp":"2026-11-17T10:00:06Z","message":{"role":"user","content":"Summary of the work so far"}}
+        {"type":"user","timestamp":"2026-11-17T10:00:07Z","message":{"role":"user","content":"Second"}}
+        {"type":"assistant","isApiErrorMessage":true,"timestamp":"2026-11-17T10:00:08Z","message":{"id":"msg_error","role":"assistant","model":"<synthetic>","stop_reason":"stop_sequence","content":[{"type":"text","text":"API Error: 500"}]}}
+        {"type":"user","timestamp":"2026-11-17T10:00:09Z","message":{"role":"user","content":"Third"}}
+        """);
+    var data = await ExportOpenCodeAsync(sessionPath, fixture.Root, includeImages: false, includeTools: true);
+
+    AssertTrue(!data.ToJsonString().Contains("SIDECHAIN", StringComparison.Ordinal), "subagent rows are not part of the conversation");
+    AssertJsonEqual(OpenCodeJson("""
+        [
+          {"type":"user","time":{"created":@t1@},"text":"First\nprompt"},
+          {"type":"assistant","time":{"created":@t2@,"completed":@t2@},"agent":"build","model":@model@,
+           "content":[{"type":"tool","id":"call_1","name":"Bash",
+             "state":{"status":"error","input":{"input":"not an object"},"error":{"type":"aborted","message":"No tool result was recorded in the Claude session."}},
+             "time":{"created":@t2@,"ran":@t2@,"completed":@t2@}}],
+           "finish":"tool-calls"},
+          {"type":"idle","time":{"created":@t2@},"outcome":"interrupted"},
+          {"type":"user","time":{"created":@t3@},"text":"[Request interrupted by user for tool use]"},
+          {"type":"synthetic","time":{"created":@t4@},"text":"<local-command-caveat>Caveat</local-command-caveat>"},
+          {"type":"compaction","time":{"created":@t6@},"status":"completed","reason":"manual","summary":"Summary of the work so far"},
+          {"type":"user","time":{"created":@t7@},"text":"Second"},
+          {"type":"assistant","time":{"created":@t8@,"completed":@t8@},"agent":"build","model":@model@,
+           "content":[{"type":"text","text":"API Error: 500"}],"finish":"error"},
+          {"type":"idle","time":{"created":@t8@},"outcome":"failed"},
+          {"type":"user","time":{"created":@t9@},"text":"Third"},
+          {"type":"idle","time":{"created":@t9@},"outcome":"interrupted"}
+        ]
+        """), OpenCodeMessagesWithoutIds(data), "opencode turn messages");
+    AssertEqual("interrupted", data["info"]!["outcome"]!.GetValue<string>(), "last outcome");
+    AssertEqual("First", data["info"]!["title"]!.GetValue<string>(), "title falls back to the first prompt line");
+}
+
+static async Task TestOpenCodeExportImagesAsync()
+{
+    using var fixture = new TempFixture();
+    var sessionPath = fixture.WriteSession("""
+        {"type":"user","sessionId":"claude-session-3","cwd":"C:\\repo","timestamp":"2026-11-17T10:00:01Z","message":{"role":"user","content":[{"type":"text","text":"Look"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8"}},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"@@@@"}},{"type":"image","source":{"type":"url","url":"https://example.com/picture.png"}},{"type":"image","source":{"type":"base64","media_type":"text/html","data":"PGI+"}},{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"/9j/\n4AAQ"}}]}}
+        """);
+    var data = await ExportOpenCodeAsync(sessionPath, fixture.Root, includeImages: true, includeTools: false);
+
+    AssertJsonEqual("""
+        [
+          {"data":"aGVsbG8=","mime":"image/png","source":{"type":"inline"},"name":"image-001.png"},
+          {"data":"/9j/4AAQ","mime":"image/jpeg","source":{"type":"inline"},"name":"image-002.jpg"}
+        ]
+        """, data["messages"]![0]!["files"], "embedded images");
+}
+
+static async Task TestOpenCodeBatchExportAsync()
+{
+    using var fixture = new TempFixture();
+    var sessionPath = WriteOpenCodeSourceSession(fixture);
+    var outputDirectory = Path.Combine(fixture.Root, "export");
+    var service = new ClaudeSessionService();
+    AssertEqual("Bug fix - 2026-11-17T10-00-02.000Z.opencode.json", ClaudeSessionService.BuildBatchExportFileName("Bug fix", "2026-11-17T10:00:02Z", "opencode"), "batch file name");
+
+    // Images are embedded, so an asset folder of the same name does not force another file name.
+    Directory.CreateDirectory(Path.Combine(outputDirectory, "Bug fix - 2026-11-17T10-00-02.000Z.opencode-assets"));
+    var job = service.StartBatchExportJob("opencode", [new(sessionPath, "Bug fix", "2026-11-17T10:00:02Z"), new(sessionPath, "Bug fix", "2026-11-17T10:00:02Z")], true, false, true, outputDirectory);
+    var status = await WaitForBatchExportAsync(() => service.GetBatchExportJobStatus(job.JobId));
+    AssertEqual("success", status.Kind, $"opencode batch export: {status.Message}");
+    var files = Directory.GetFiles(outputDirectory).Select(Path.GetFileName).Order(StringComparer.Ordinal).ToArray();
+    AssertEqual("Bug fix - 2026-11-17T10-00-02.000Z.opencode-2.json,Bug fix - 2026-11-17T10-00-02.000Z.opencode.json", string.Join(",", files), "batch output files");
+
+    var exports = files.Select(file => (JsonObject)JsonNode.Parse(File.ReadAllText(Path.Combine(outputDirectory, file!)))!).ToArray();
+    foreach (var export in exports) AssertOpenCodeImportable(export);
+    // OpenCode reports the second import of a session as a conflict instead of adding a copy.
+    AssertTrue(JsonNode.DeepEquals(exports[0], exports[1]), "the same session always exports with the same identifiers");
+}
+
+static Task TestOpenCodeIdentifiers()
+{
+    // Timestamp and counter prefixes of identifiers that OpenCode 2.3.0 created.
+    var message = ClaudeSessionService.BuildOpenCodeIdentifier("msg", 1794882744955, 1, false, "seed");
+    var session = ClaudeSessionService.BuildOpenCodeIdentifier("ses", 1794882744921, 1, true, "seed");
+    AssertTrue(System.Text.RegularExpressions.Regex.IsMatch(message, "^msg_1e759327b001[0-9A-Za-z]{14}$"), $"message identifier layout: {message}");
+    AssertTrue(System.Text.RegularExpressions.Regex.IsMatch(session, "^ses_e18a6cda6ffe[0-9A-Za-z]{14}$"), $"session identifier layout: {session}");
+    AssertTrue(message != ClaudeSessionService.BuildOpenCodeIdentifier("msg", 1794882744955, 1, false, "other"), "the seed decides the suffix");
+    return Task.CompletedTask;
 }
 
 static async Task TestSingleExportCollisionsAsync()
@@ -797,6 +1136,126 @@ static async Task TestSessionProbeCancellationAsync()
     }
 }
 
+static void WriteScanFixtureSessions(TempFixture fixture, int count)
+{
+    for (var index = 0; index < count; index++)
+    {
+        fixture.WriteSession("""
+            {"type":"user","sessionId":"scan-@index@","cwd":"C:\\repo","timestamp":"2026-03-16T12:@time@.000Z","message":{"role":"user","content":"prompt @index@"}}
+            {"type":"ai-title","sessionId":"scan-@index@","aiTitle":"Session @index@"}
+            """.Replace("@index@", index.ToString()).Replace("@time@", $"{index / 60:00}:{index % 60:00}"),
+            Path.Combine(".claude", "projects", $"repo-{index % 7}", $"session-{index}.jsonl"));
+    }
+}
+
+static async Task TestParallelSessionScanAsync()
+{
+    using var fixture = new TempFixture();
+    WriteScanFixtureSessions(fixture, 120);
+    var reports = new List<SessionScanProgress>();
+    var progress = new InlineProgress<SessionScanProgress>(value => reports.Add(value));
+    var service = new ClaudeSessionService();
+
+    var result = await service.FindClaudeSessionsAsync(Path.Combine(fixture.Root, ".claude"), null, false, null, null, false, progress: progress);
+
+    AssertTrue(result.IsComplete, "scan is complete");
+    AssertEqual(120, result.ScannedFileCount, "scanned file count");
+    AssertEqual(120, result.Sessions.Count, "session count");
+    AssertEqual(120, result.Sessions.Select(session => session.Id).Distinct().Count(), "every session appears once");
+    AssertEqual("Session 119,Session 118,Session 117", string.Join(",", result.Sessions.Take(3).Select(session => session.ThreadName)), "sessions are sorted by newest first");
+    // The files are probed on several threads; the reports still count up one file at a time.
+    AssertEqual(0, reports[0].ScannedFileCount, "first report announces the total");
+    AssertEqual(string.Join(",", Enumerable.Range(1, 120)), string.Join(",", reports.Skip(1).Select(report => report.ScannedFileCount)), "reports arrive in order");
+    AssertEqual(120, reports.Count(report => report.Match is not null), "every match is reported once");
+}
+
+static async Task TestSessionTitlesAsync()
+{
+    using var fixture = new TempFixture();
+    const string prompt = """{"type":"user","sessionId":"@id@","cwd":"C:\\repo","timestamp":"2026-03-16T12:00:0@second@.000Z","message":{"role":"user","content":"prompt"}}""";
+    string Session(string id, int second, params string[] titleRows)
+        => string.Join('\n', new[] { prompt.Replace("@id@", id).Replace("@second@", second.ToString()) }.Concat(titleRows));
+    // Claude Code repeats title rows through the file; the last one of each kind is current.
+    fixture.WriteSession(Session("custom-only", 1,
+        """{"type":"custom-title","sessionId":"custom-only","customTitle":"Old name"}""",
+        """{"type":"custom-title","sessionId":"custom-only","customTitle":"Bathroom 2"}"""), Path.Combine(".claude", "projects", "repo", "custom-only.jsonl"));
+    fixture.WriteSession(Session("both", 2,
+        """{"type":"custom-title","sessionId":"both","customTitle":"Named by the user"}""",
+        """{"type":"ai-title","sessionId":"both","aiTitle":"Generated title"}"""), Path.Combine(".claude", "projects", "repo", "both.jsonl"));
+    fixture.WriteSession(Session("generated", 3,
+        """{"type":"ai-title","sessionId":"generated","aiTitle":"Generated title"}""",
+        """{"type":"custom-title","sessionId":"generated","customTitle":"  "}"""), Path.Combine(".claude", "projects", "repo", "generated.jsonl"));
+    fixture.WriteSession(Session("untitled", 4), Path.Combine(".claude", "projects", "repo", "untitled.jsonl"));
+
+    var result = await new ClaudeSessionService().FindClaudeSessionsAsync(Path.Combine(fixture.Root, ".claude"), null, false, null, null, false);
+
+    var titles = result.Sessions.ToDictionary(session => session.Id, session => session.ThreadName);
+    AssertEqual("Bathroom 2", titles["custom-only"], "a title set by the user names the session");
+    AssertEqual("Named by the user", titles["both"], "a title set by the user wins over the generated one");
+    AssertEqual("Generated title", titles["generated"], "a blank custom title does not hide the generated one");
+    AssertEqual(null, titles["untitled"], "a session without title rows has no title");
+}
+
+static async Task TestRefreshScanReportsProgressAsync()
+{
+    using var fixture = new TempFixture();
+    Directory.CreateDirectory(Path.Combine(fixture.Root, ".claude", "projects"));
+    var previousHome = Environment.GetEnvironmentVariable("CLAUDE_HOME");
+    Environment.SetEnvironmentVariable("CLAUDE_HOME", Path.Combine(fixture.Root, ".claude"));
+    try
+    {
+        var viewModel = new MainWindowViewModel(new ClaudeSessionService(), new NoUiService(), new AppSettingsService(Path.Combine(fixture.Root, "settings.json")));
+        await WaitUntilAsync(() => !viewModel.StartupLoadingVisible && !viewModel.StartupScanActive && !viewModel.IsLoading, "startup scan of an empty history");
+
+        WriteScanFixtureSessions(fixture, 60);
+        var statuses = new List<string>();
+        viewModel.PropertyChanged += (_, change) =>
+        {
+            if (change.PropertyName == nameof(MainWindowViewModel.StatusMessage))
+            {
+                lock (statuses) statuses.Add(viewModel.StatusMessage);
+            }
+        };
+        // Progress<T> posts to the context it was created in; running the posts inline delivers every report before the scan ends.
+        SynchronizationContext.SetSynchronizationContext(new InlineSynchronizationContext());
+        viewModel.ShowAllSessionsCommand.Execute(null);
+        SynchronizationContext.SetSynchronizationContext(null);
+        await WaitUntilAsync(() => !viewModel.IsLoading, "All Sessions scan");
+
+        string[] seen;
+        lock (statuses) seen = statuses.ToArray();
+        AssertEqual("Scanning session files...", seen[0], "the status line switches to the scan at once");
+        AssertContains("Scanning session files: 0 of 60, 0 sessions found...", string.Join("\n", seen), "the scan announces its size");
+        AssertContains("Scanning session files: 1 of 60, 1 session found...", string.Join("\n", seen), "the scan reports each found session");
+        AssertContains("Scanning session files: 60 of 60, 60 sessions found...", string.Join("\n", seen), "the scan reports its last file");
+        AssertEqual("Loaded 60 sessions after scanning 60 session files.", seen[^1], "final status");
+        AssertEqual(60, viewModel.Sessions.Count, "loaded sessions");
+        AssertEqual(100d, viewModel.ScanProgressPercent, "progress bar reaches the end");
+        AssertTrue(!viewModel.ScanProgressIndeterminate, "progress bar shows a known amount");
+        AssertTrue(!viewModel.HasPartialSessionResults, "no partial-results notice after a complete scan");
+    }
+    finally
+    {
+        SynchronizationContext.SetSynchronizationContext(null);
+        Environment.SetEnvironmentVariable("CLAUDE_HOME", previousHome);
+    }
+}
+
+static async Task WaitUntilAsync(Func<bool> condition, string label)
+{
+    for (var attempt = 0; attempt < 600; attempt++)
+    {
+        if (condition())
+        {
+            return;
+        }
+
+        await Task.Delay(25);
+    }
+
+    throw new TimeoutException($"Timed out waiting for: {label}");
+}
+
 static async Task<ExportJobStatus> WaitForExportAsync(Func<ExportJobStatus> readStatus)
 {
     for (var attempt = 0; attempt < 200; attempt++)
@@ -919,4 +1378,23 @@ sealed class TempFixture : IDisposable
 sealed class InlineProgress<T>(Action<T> report) : IProgress<T>
 {
     public void Report(T value) => report(value);
+}
+
+sealed class InlineSynchronizationContext : SynchronizationContext
+{
+    public override void Post(SendOrPostCallback callback, object? state) => callback(state);
+}
+
+sealed class NoUiService : IUiService
+{
+    public Task<string?> PickDirectoryAsync(string? startingFolder) => Task.FromResult<string?>(null);
+    public Task<string?> PickExportDirectoryAsync(string sessionFilePath) => Task.FromResult<string?>(null);
+    public Task<string?> PickExportDirectoryFromAsync(string? startingFolder) => Task.FromResult<string?>(null);
+    public Task<string?> PickHtmlExportDestinationAsync(string sessionFilePath, bool includeImages, bool inlineImages) => Task.FromResult<string?>(null);
+    public Task<string?> SaveStatisticsTextAsync(string suggestedFileName, string extension, string content) => Task.FromResult<string?>(null);
+    public Task<string?> SaveStatisticsImageAsync(string suggestedFileName) => Task.FromResult<string?>(null);
+    public Task CopyTextAsync(string text) => Task.CompletedTask;
+    public Task<bool> OpenPathAsync(string path) => Task.FromResult(false);
+    public Task<bool> RevealPathAsync(string path) => Task.FromResult(false);
+    public Task ShowMessageAsync(string title, string message) => Task.CompletedTask;
 }

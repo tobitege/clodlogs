@@ -28,6 +28,9 @@ public sealed class MainWindowViewModel : ViewModelBase
     private bool _showLiveSessions = true;
     private bool _showArchivedSessions = true;
     private bool _isLoading;
+    private int _scanVersion;
+    private double _scanProgressPercent;
+    private bool _scanProgressIndeterminate = true;
     private bool _isDetailLoading;
     private bool _startupLoadingVisible = true;
     private string _startupLoadingMessage = "Loading saved settings...";
@@ -129,7 +132,7 @@ public sealed class MainWindowViewModel : ViewModelBase
     public ObservableCollection<TokenUsageDailyBarViewModel> TokenSummaryDailyBars { get; } = [];
     public ObservableCollection<TokenUsageModelRowViewModel> TokenSummaryModelRows { get; } = [];
     public ObservableCollection<AnthropicPricingRowViewModel> AnthropicPricingRows { get; } = [];
-    public string[] ExportFormats { get; } = ["markdown", "html"];
+    public string[] ExportFormats { get; } = ["markdown", "html", ClaudeSessionService.OpenCodeExportFormat];
 
     public AsyncRelayCommand RefreshCommand { get; }
     public AsyncRelayCommand BrowseFolderCommand { get; }
@@ -248,6 +251,19 @@ public sealed class MainWindowViewModel : ViewModelBase
                 ShowAllSessionsCommand.RaiseCanExecuteChanged();
             }
         }
+    }
+
+    public double ScanProgressPercent
+    {
+        get => _scanProgressPercent;
+        private set => SetProperty(ref _scanProgressPercent, value);
+    }
+
+    // True until a scan has reported how many files it has to read.
+    public bool ScanProgressIndeterminate
+    {
+        get => _scanProgressIndeterminate;
+        private set => SetProperty(ref _scanProgressIndeterminate, value);
     }
 
     public bool IsDetailLoading
@@ -490,9 +506,17 @@ public sealed class MainWindowViewModel : ViewModelBase
                 {
                     session.RefreshOutputFileName(value);
                 }
+
+                OnPropertyChanged(nameof(ExportFormatHint));
+                OnPropertyChanged(nameof(ExportFormatHintVisible));
             }
         }
     }
+
+    public bool ExportFormatHintVisible => ExportFormat == ClaudeSessionService.OpenCodeExportFormat;
+    public string ExportFormatHint => ExportFormatHintVisible
+        ? "Writes a session file for OpenCode 2. Import it there with: opencode session import <file>. Images are embedded in the file. Include tool calls when the session is meant to be continued."
+        : "";
 
     public string BatchExportDirectory
     {
@@ -810,12 +834,28 @@ public sealed class MainWindowViewModel : ViewModelBase
         IsLoading = true;
         ErrorMessage = null;
         _browseMode = browseMode;
-        if (progress is not null)
+        var scanVersion = ++_scanVersion;
+        var startupScan = progress is not null;
+        ScanProgressIndeterminate = true;
+        ScanProgressPercent = 0;
+        if (startupScan)
         {
             Sessions.Clear();
             FilteredSessions.Clear();
             SelectedSession = null;
             RefreshHeaderProperties();
+        }
+        else
+        {
+            // The list is replaced when the scan is done; until then the status line follows the scan.
+            PartialSessionResultsMessage = "";
+            StatusMessage = "Scanning session files...";
+            var foundSessionCount = 0;
+            progress = new Progress<SessionScanProgress>(value =>
+            {
+                if (value.Match is not null) foundSessionCount++;
+                ApplyRefreshScanProgress(scanVersion, value, foundSessionCount);
+            });
         }
         try
         {
@@ -834,7 +874,9 @@ public sealed class MainWindowViewModel : ViewModelBase
                 includeCrossSessionWrites,
                 progress: progress,
                 cancellationToken: cancellationToken));
-            if (progress is not null)
+            // Progress reports that arrive from here on belong to a finished scan.
+            _scanVersion++;
+            if (startupScan)
             {
                 _startupScanResultFinalized = true;
                 _startupReportedScannedFileCount = _result.ScannedFileCount;
@@ -866,6 +908,22 @@ public sealed class MainWindowViewModel : ViewModelBase
             RefreshHeaderProperties();
         }
     }
+
+    // Refresh, Browse Folder and All Sessions keep the previous list on screen, so the scan reports in the status line.
+    private void ApplyRefreshScanProgress(int scanVersion, SessionScanProgress progress, int foundSessionCount)
+    {
+        if (scanVersion != _scanVersion)
+        {
+            return;
+        }
+
+        ScanProgressIndeterminate = progress.TotalFileCount == 0;
+        ScanProgressPercent = progress.TotalFileCount == 0 ? 0 : progress.ScannedFileCount * 100d / progress.TotalFileCount;
+        StatusMessage = BuildScanProgressMessage(progress.ScannedFileCount, progress.TotalFileCount, foundSessionCount);
+    }
+
+    internal static string BuildScanProgressMessage(int scannedFileCount, int totalFileCount, int foundSessionCount)
+        => $"Scanning session files: {scannedFileCount:n0} of {totalFileCount:n0}, {foundSessionCount:n0} session{(foundSessionCount == 1 ? "" : "s")} found...";
 
     private void ApplyStartupScanProgress(SessionScanProgress progress)
     {
@@ -1074,7 +1132,8 @@ public sealed class MainWindowViewModel : ViewModelBase
 
         string? outputDirectory = null;
         string? outputPath = null;
-        if (ExportFormat == "markdown" || (ExportFormat == "html" && ExportImages && !ExportInlineImages))
+        if (ExportFormat is "markdown" or ClaudeSessionService.OpenCodeExportFormat
+            || (ExportFormat == "html" && ExportImages && !ExportInlineImages))
         {
             outputDirectory = await _ui.PickExportDirectoryAsync(SelectedSession.File);
             if (outputDirectory is null) return;

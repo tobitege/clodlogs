@@ -10,13 +10,14 @@ using Clodlogs.Desktop.Models;
 
 namespace Clodlogs.Desktop.Services;
 
-public sealed class ClaudeSessionService
+public sealed partial class ClaudeSessionService
 {
     public const long LargeSessionWarningBytes = 64L * 1024 * 1024;
     public const long AutoDetailParseLimitBytes = 128L * 1024 * 1024;
     public const int MaxJsonlLineBytesHard = 32 * 1024 * 1024;
     public const int ExportMaxJsonlLineBytes = 128 * 1024 * 1024;
     private const int BlobTextThresholdBytes = 4096;
+    private static readonly int SessionScanParallelism = Math.Clamp(Environment.ProcessorCount, 2, 8);
     private static readonly TimeSpan BatchExportJobRetention = TimeSpan.FromMinutes(5);
     private static readonly JsonSerializerOptions CompactJsonOptions = new()
     {
@@ -104,19 +105,19 @@ public sealed class ClaudeSessionService
         var dateRange = DateRange.Create(dateFrom, dateTo);
         var matches = new List<SessionMetaMatch>();
         var scannedFileCount = 0;
+        var resultGate = new object();
         progress?.Report(new SessionScanProgress(0, files.Count, null));
-        foreach (var file in files)
+        try
         {
-            if (cancellationToken.IsCancellationRequested)
+            // Every file is read to its end, so a large history is probed on several threads.
+            var parallelOptions = new ParallelOptions
             {
-                isComplete = false;
-                break;
-            }
-
-            SessionMetaMatch? match = null;
-            var fileCompleted = false;
-            try
+                MaxDegreeOfParallelism = SessionScanParallelism,
+                CancellationToken = cancellationToken
+            };
+            await Parallel.ForEachAsync(files, parallelOptions, async (file, _) =>
             {
+                SessionMetaMatch? match = null;
                 var probe = await ProbeSessionFileAsync(file, cancellationToken);
                 if (probe is not null && dateRange.Matches(probe.StartedAt, probe.UpdatedAt))
                 {
@@ -161,29 +162,26 @@ public sealed class ClaudeSessionService
                     }
                 }
 
-                cancellationToken.ThrowIfCancellationRequested();
-                if (match is not null)
+                lock (resultGate)
                 {
-                    matches.Add(match);
-                }
-                fileCompleted = true;
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                isComplete = false;
-                break;
-            }
-            finally
-            {
-                if (fileCompleted)
-                {
+                    // A file that finishes after the scan was stopped is not part of the partial result.
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (match is not null)
+                    {
+                        matches.Add(match);
+                    }
+
                     scannedFileCount++;
                     if (match is not null || scannedFileCount == files.Count || scannedFileCount % 25 == 0)
                     {
                         progress?.Report(new SessionScanProgress(scannedFileCount, files.Count, match));
                     }
                 }
-            }
+            });
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            isComplete = false;
         }
 
         matches.Sort((left, right) => CompareByNewestDesc(left, right));
@@ -456,7 +454,7 @@ public sealed class ClaudeSessionService
             try
             {
                 var path = await ExportSessionJsonlAsync(format, sessionFilePath, includeImages, inlineImages, includeToolCallResults, outputDirectory, outputPath, progress => SetExportStatus(jobId, progress), record.Cancellation.Token);
-                SetExportStatus(jobId, new ExportJobStatus("success", 100, "done", $"{ToTitleCase(format)} written to {path}", path));
+                SetExportStatus(jobId, new ExportJobStatus("success", 100, "done", $"{GetExportFormatLabel(format)} written to {path}", path));
             }
             catch (OperationCanceledException)
             {
@@ -506,7 +504,7 @@ public sealed class ClaudeSessionService
 
                 resolvedOutputDirectory = ResolveFilesystemPath(outputDirectory);
                 Directory.CreateDirectory(resolvedOutputDirectory);
-                var needsExternalAssets = includeImages && (format == "markdown" || !inlineImages);
+                var needsExternalAssets = ExportNeedsExternalAssets(format, includeImages, inlineImages);
 
                 for (var index = 0; index < batch.Length; index++)
                 {
@@ -1064,15 +1062,29 @@ public sealed class ClaudeSessionService
         var timestamp = DateTimeOffset.TryParse(startedAt, CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces, out var parsed)
             ? parsed.ToUniversalTime().ToString("yyyy-MM-dd'T'HH-mm-ss.fff'Z'", CultureInfo.InvariantCulture)
             : "unknown-start";
-        var extension = format == "html" ? ".html" : ".md";
-        return $"{safeName} - {timestamp}{extension}";
+        return $"{safeName} - {timestamp}{GetExportFileSuffix(format)}";
     }
+
+    private static string GetExportFileSuffix(string format)
+        => format switch
+        {
+            "html" => ".html",
+            OpenCodeExportFormat => OpenCodeSessionFileSuffix,
+            _ => ".md"
+        };
+
+    private static string GetExportFormatLabel(string format)
+        => format == OpenCodeExportFormat ? "OpenCode session file" : ToTitleCase(format);
+
+    // Markdown and HTML with linked images write an asset folder next to the export; an OpenCode session file embeds its images.
+    private static bool ExportNeedsExternalAssets(string format, bool includeImages, bool inlineImages)
+        => includeImages && (format == "markdown" || format == "html" && !inlineImages);
 
     private static void ValidateExportFormat(string format)
     {
-        if (format is not ("markdown" or "html"))
+        if (format is not ("markdown" or "html" or OpenCodeExportFormat))
         {
-            throw new ArgumentException("Export format must be markdown or html.", nameof(format));
+            throw new ArgumentException("Export format must be markdown, html or opencode.", nameof(format));
         }
     }
 
@@ -1092,25 +1104,51 @@ public sealed class ClaudeSessionService
         var meta = await ReadSessionExportMetadataAsync(sessionFilePath, cancellationToken);
         var fileSize = new FileInfo(sessionFilePath).Length;
         var isHtml = format == "html";
+        var isOpenCode = format == OpenCodeExportFormat;
         var automaticPath = string.IsNullOrWhiteSpace(outputPath);
         var directory = automaticPath
             ? ResolveOutputDirectory(sessionFilePath, outputDirectory)
             : Path.GetDirectoryName(ResolveFilesystemPath(outputPath!))!;
         Directory.CreateDirectory(directory);
         var resolvedOutputPath = automaticPath
-            ? CreateAvailableExportPath(directory, $"{Path.GetFileNameWithoutExtension(sessionFilePath)}.{(isHtml ? "html" : "md")}", includeImages && (!isHtml || !inlineImages), cancellationToken)
+            ? CreateAvailableExportPath(directory, $"{Path.GetFileNameWithoutExtension(sessionFilePath)}{GetExportFileSuffix(format)}", ExportNeedsExternalAssets(format, includeImages, inlineImages), cancellationToken)
+            : isOpenCode ? ResolveFilesystemPath(outputPath!)
             : isHtml ? EnsureHtmlOutputPath(ResolveFilesystemPath(outputPath!)) : EnsureMarkdownOutputPath(ResolveFilesystemPath(outputPath!));
         var temporaryPath = Path.Combine(directory, $".clodlogs-{Guid.NewGuid():N}.tmp");
         var imageContext = new ExportImageContext(
             isHtml ? ExportImageRenderMode.Html : ExportImageRenderMode.Markdown,
-            includeImages, inlineImages, directory, $"{Path.GetFileNameWithoutExtension(resolvedOutputPath)}-assets");
+            includeImages && !isOpenCode, inlineImages, directory, $"{Path.GetFileNameWithoutExtension(resolvedOutputPath)}-assets");
+        var openCode = isOpenCode
+            ? new OpenCodeSessionConverter(
+                meta.Id,
+                meta.Cwd,
+                new DateTimeOffset(File.GetLastWriteTimeUtc(sessionFilePath)).ToUnixTimeMilliseconds(),
+                includeImages,
+                includeToolCallResults)
+            : null;
         try
         {
             progress(new ExportJobStatus("working", 4, "reading", $"Preparing {format} export...", null));
             await using (var stream = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
             await using (var writer = new StreamWriter(stream, new UTF8Encoding(false)))
             {
-                if (isHtml)
+                var transcriptCount = 0;
+                // One message per line; the session info follows the messages because its totals are known only at the end.
+                async Task WriteOpenCodeMessagesAsync(IEnumerable<JsonObject> messages)
+                {
+                    foreach (var message in messages)
+                    {
+                        await writer.WriteAsync(transcriptCount > 0 ? ",\n    " : "    ");
+                        await writer.WriteAsync(message.ToJsonString(CompactJsonOptions));
+                        transcriptCount++;
+                    }
+                }
+
+                if (openCode is not null)
+                {
+                    await writer.WriteAsync("{\n  \"messages\": [\n");
+                }
+                else if (isHtml)
                 {
                     await writer.WriteAsync(BuildHtmlExportPrefix(sessionFilePath, meta, includeImages, inlineImages, includeToolCallResults));
                 }
@@ -1134,37 +1172,52 @@ public sealed class ClaudeSessionService
                     await writer.WriteLineAsync();
                 }
 
-                var transcriptCount = 0;
                 var omittedBootstrapMessages = 0;
                 var sawFirstUser = false;
                 await foreach (var evt in StreamJsonlRecordsAsync(sessionFilePath, ExportMaxJsonlLineBytes, true, cancellationToken))
                 {
                     if (evt.Record is null) continue;
-                    var built = BuildTranscriptEntries(evt.Record, transcriptCount, sawFirstUser, imageContext, includeToolCallResults);
-                    sawFirstUser = built.SawFirstUserMessage;
-                    omittedBootstrapMessages += built.OmittedBootstrapMessages;
-                    foreach (var entry in built.Entries.Where(entry => ShouldIncludeTranscriptEntry(entry, includeToolCallResults)))
+                    if (openCode is not null)
                     {
-                        if (!isHtml && transcriptCount > 0) await writer.WriteLineAsync();
-                        await writer.WriteLineAsync(isHtml ? RenderHtmlTranscriptEntry(entry) : RenderMarkdownTranscriptEntry(entry));
-                        transcriptCount++;
+                        await WriteOpenCodeMessagesAsync(openCode.Push(evt.Record));
+                    }
+                    else
+                    {
+                        var built = BuildTranscriptEntries(evt.Record, transcriptCount, sawFirstUser, imageContext, includeToolCallResults);
+                        sawFirstUser = built.SawFirstUserMessage;
+                        omittedBootstrapMessages += built.OmittedBootstrapMessages;
+                        foreach (var entry in built.Entries.Where(entry => ShouldIncludeTranscriptEntry(entry, includeToolCallResults)))
+                        {
+                            if (!isHtml && transcriptCount > 0) await writer.WriteLineAsync();
+                            await writer.WriteLineAsync(isHtml ? RenderHtmlTranscriptEntry(entry) : RenderMarkdownTranscriptEntry(entry));
+                            transcriptCount++;
+                        }
                     }
                     ReportByteProgress(progress, evt.BytesProcessed, fileSize, "rendering", 10, 82, $"Rendering {format} transcript...");
                 }
 
-                if (omittedBootstrapMessages > 0)
+                if (openCode is not null)
                 {
-                    await writer.WriteLineAsync(isHtml
-                        ? $"<p>Omitted bootstrap messages: {omittedBootstrapMessages}</p>"
-                        : $"\n_Omitted bootstrap messages: {omittedBootstrapMessages}_");
+                    var (messages, info) = openCode.Finish();
+                    await WriteOpenCodeMessagesAsync(messages);
+                    await writer.WriteAsync($"\n  ],\n  \"info\": {info.ToJsonString(CompactJsonOptions)}\n}}\n");
                 }
-                if (transcriptCount == 0)
+                else
                 {
-                    await writer.WriteLineAsync(isHtml
-                        ? "<p class=\"empty\">No transcript items were found in the response stream.</p>"
-                        : "_No transcript items were found in the response stream._");
+                    if (omittedBootstrapMessages > 0)
+                    {
+                        await writer.WriteLineAsync(isHtml
+                            ? $"<p>Omitted bootstrap messages: {omittedBootstrapMessages}</p>"
+                            : $"\n_Omitted bootstrap messages: {omittedBootstrapMessages}_");
+                    }
+                    if (transcriptCount == 0)
+                    {
+                        await writer.WriteLineAsync(isHtml
+                            ? "<p class=\"empty\">No transcript items were found in the response stream.</p>"
+                            : "_No transcript items were found in the response stream._");
+                    }
+                    if (isHtml) await writer.WriteLineAsync("</main></body></html>");
                 }
-                if (isHtml) await writer.WriteLineAsync("</main></body></html>");
             }
 
             cancellationToken.ThrowIfCancellationRequested();
@@ -1410,6 +1463,7 @@ public sealed class ClaudeSessionService
             string? startedAt = null;
             string? updatedAt = null;
             string? threadName = null;
+            string? customTitle = null;
             string? source = "claude";
 
             await foreach (var evt in StreamJsonlRecordsAsync(filePath, MaxJsonlLineBytesHard, false, cancellationToken))
@@ -1438,11 +1492,21 @@ public sealed class ClaudeSessionService
                         threadName = title;
                     }
                 }
+                else if (type == "custom-title")
+                {
+                    var title = GetString(record, "customTitle")?.Trim();
+                    if (!string.IsNullOrWhiteSpace(title))
+                    {
+                        customTitle = title;
+                    }
+                }
 
                 var payload = record["payload"] as JsonObject;
                 source ??= GetString(payload, "source");
             }
 
+            // A title the user set wins over the generated one.
+            threadName = customTitle ?? threadName;
             id ??= Path.GetFileNameWithoutExtension(filePath);
             cwd ??= DecodeClaudeProjectFolderPath(Path.GetFileName(Path.GetDirectoryName(filePath) ?? "")) ?? Path.GetDirectoryName(filePath) ?? "";
             updatedAt ??= startedAt ?? info.LastWriteTimeUtc.ToString("O");
@@ -1490,7 +1554,7 @@ public sealed class ClaudeSessionService
             JsonValue value when value.TryGetValue<string>(out var text) => new JsonArray(text),
             _ => null
         };
-        if (message is null || role is null or "developer" || content is null)
+        if (message is null || role is null or "developer" || content is null || !IsClaudeTranscriptRecord(record))
         {
             return new TranscriptBuildResult([], sawFirstUserMessage, 0);
         }
@@ -1821,13 +1885,23 @@ public sealed class ClaudeSessionService
             return false;
         }
 
-        var content = message?["content"] as JsonArray;
-        var text = content is null ? "" : ExtractClaudeTextContent(content);
+        // Claude Code writes a typed prompt either as plain text or as a list of content blocks.
+        var text = message?["content"] switch
+        {
+            JsonArray content => ExtractClaudeTextContent(content),
+            JsonValue value when value.TryGetValue<string>(out var plainText) => plainText,
+            _ => ""
+        };
         return !string.IsNullOrWhiteSpace(text) && !LooksLikeBootstrapContext(text);
     }
 
     private static int CountClaudeToolUses(JsonObject record)
     {
+        if (!IsClaudeTranscriptRecord(record))
+        {
+            return 0;
+        }
+
         var content = (record["message"] as JsonObject)?["content"] as JsonArray;
         return content?.Count(item => (item as JsonObject)?["type"]?.GetValue<string>() == "tool_use") ?? 0;
     }
