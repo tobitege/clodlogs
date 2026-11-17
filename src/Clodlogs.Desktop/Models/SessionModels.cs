@@ -178,6 +178,13 @@ public sealed record ExportJobStatus(
     string Message,
     string? OutputPath);
 
+/// <summary>What an export contains besides the prompts and the answers.</summary>
+public sealed record SessionExportOptions(
+    bool IncludeImages,
+    bool InlineImages,
+    bool IncludeToolCallResults,
+    bool IncludeThinking = false);
+
 public sealed record BatchExportSessionRequest(
     string SessionFilePath,
     string SessionName,

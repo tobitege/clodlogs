@@ -279,7 +279,13 @@
 
     <Grid Grid.Row="3" ColumnDefinitions="*,Auto">
       <TextBlock Text="{CompiledBinding StatusMessage}" Classes="muted" VerticalAlignment="Center" />
-      <ProgressBar Grid.Column="1" Width="180" IsIndeterminate="True" IsVisible="{CompiledBinding IsLoading}" />
+      <ProgressBar Grid.Column="1"
+                   Width="180"
+                   Minimum="0"
+                   Maximum="100"
+                   Value="{CompiledBinding ScanProgressPercent}"
+                   IsIndeterminate="{CompiledBinding ScanProgressIndeterminate}"
+                   IsVisible="{CompiledBinding IsLoading}" />
     </Grid>
 
     <Border Grid.RowSpan="4" Background="#88000000" IsVisible="{CompiledBinding HasError}">
@@ -298,9 +304,11 @@
           <TextBlock Classes="kicker" Text="EXPORT SESSION" />
           <TextBlock Text="{CompiledBinding SelectedTitle}" FontSize="24" FontWeight="Bold" TextWrapping="Wrap" />
           <ComboBox ItemsSource="{CompiledBinding ExportFormats}" SelectedItem="{CompiledBinding ExportFormat, Mode=TwoWay}" />
+          <TextBlock Classes="muted" Text="{CompiledBinding ExportFormatHint}" IsVisible="{CompiledBinding ExportFormatHintVisible}" TextWrapping="Wrap" />
           <CheckBox Content="Include images" IsChecked="{CompiledBinding ExportImages, Mode=TwoWay}" />
           <CheckBox Content="Inline images in HTML" IsChecked="{CompiledBinding ExportInlineImages, Mode=TwoWay}" />
           <CheckBox Content="Include tool calls and tool outputs" IsChecked="{CompiledBinding ExportToolCallResults, Mode=TwoWay}" />
+          <CheckBox Content="Include thinking" IsChecked="{CompiledBinding ExportThinking, Mode=TwoWay}" />
           <WrapPanel HorizontalAlignment="Right">
             <Button Classes="primary" Content="Start Export" Command="{CompiledBinding ConfirmExportCommand}" />
             <Button Classes="ghost" Content="Cancel" Command="{CompiledBinding DismissDialogsCommand}" />
@@ -331,7 +339,9 @@
               <CheckBox Content="Include images" IsChecked="{CompiledBinding ExportImages, Mode=TwoWay}" />
               <CheckBox Content="Inline images in HTML" IsChecked="{CompiledBinding ExportInlineImages, Mode=TwoWay}" />
               <CheckBox Content="Include tool calls and tool outputs" IsChecked="{CompiledBinding ExportToolCallResults, Mode=TwoWay}" />
+              <CheckBox Content="Include thinking" IsChecked="{CompiledBinding ExportThinking, Mode=TwoWay}" />
             </WrapPanel>
+            <TextBlock Classes="muted" Text="{CompiledBinding ExportFormatHint}" IsVisible="{CompiledBinding ExportFormatHintVisible}" TextWrapping="Wrap" />
           </StackPanel>
 
           <Border Grid.Row="1" Classes="card" Padding="0">
