@@ -16,6 +16,9 @@ public sealed partial class ClaudeSessionService
     private const string OpenCodeIdentifierAlphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     private const int OpenCodeIdentifierSuffixLength = 14;
     private const int OpenCodeIdentifierMaxCounter = 0xfff;
+    // Claude Code writes rows under this model name itself: API errors and "No response requested."
+    private const string ClaudeSyntheticModel = "<synthetic>";
+    private const string ClaudeNoResponsePlaceholder = "No response requested.";
 
     /// <summary>
     /// Builds an identifier with OpenCode's layout: a prefix, twelve hex digits holding the
@@ -38,19 +41,6 @@ public sealed partial class ClaudeSessionService
         return $"{prefix}_{value.ToString("x12", CultureInfo.InvariantCulture)}{new string(suffix)}";
     }
 
-    // Rows such as api-request-blob repeat conversation content; only user and assistant rows are the transcript.
-    private static bool IsClaudeTranscriptRecord(JsonObject record)
-        => GetString(record, "type") is null or "user" or "assistant";
-
-    // Claude Code reports a finished background task or subagent as a user row. It is the late result of a tool call.
-    private static bool IsClaudeTaskNotification(JsonObject record, string text)
-        => GetString(record["origin"] as JsonObject, "kind") == "task-notification"
-            || text.TrimStart().StartsWith("<task-notification>", StringComparison.Ordinal);
-
-    // A user row that the host wrote to start a turn, such as a CI event, not something the user typed.
-    private static bool IsClaudeHostTurn(JsonObject record)
-        => GetString(record, "turnOrigin") is "auto_continuation" or "host_synthetic";
-
     private static bool GetBoolean(JsonObject? obj, string property)
         => obj is not null
             && obj.TryGetPropertyValue(property, out var node)
@@ -62,14 +52,12 @@ public sealed partial class ClaudeSessionService
         string sessionId,
         string cwd,
         long fallbackTimestampMs,
-        bool includeImages,
-        bool includeToolCallResults)
+        SessionExportOptions options)
     {
         private const string Agent = "build";
         private const string Provider = "anthropic";
         private const string UnknownModel = "unknown";
         private const string MissingToolResultMessage = "No tool result was recorded in the Claude session.";
-        private const string UserInterruptionPrefix = "[Request interrupted by user";
         private const int MaxDerivedTitleLength = 80;
         private const int MaxToolErrorMessageLength = 500;
 
@@ -91,6 +79,8 @@ public sealed partial class ClaudeSessionService
         private string? _claudeVersion;
         private string _compactionReason = "auto";
         private bool _sawFirstUserMessage;
+        // The previous message row if it was a user row with text; some rows are read in pairs.
+        private ClaudeUserRowKind? _previousUserRow;
 
         // The model response that is being read; its message object exists once it has content.
         private PendingMessage? _currentStep;
@@ -181,6 +171,15 @@ public sealed partial class ClaudeSessionService
         // Claude writes one row per content block; rows with the same message id are one model response.
         private void PushAssistantRecord(JsonObject record, JsonObject message, JsonArray content, long timestampMs)
         {
+            _previousUserRow = null;
+            var model = GetString(message, "model");
+            var isApiError = GetBoolean(record, "isApiErrorMessage");
+            // Claude Code writes this row itself where the model was not asked; it belongs to no response.
+            if (model == ClaudeSyntheticModel && !isApiError && ReadClaudeTextBlocks(content) is [var onlyText] && onlyText.Trim() == ClaudeNoResponsePlaceholder)
+            {
+                return;
+            }
+
             var messageId = GetString(message, "id");
             if (messageId is null || messageId != _stepMessageId)
             {
@@ -190,13 +189,12 @@ public sealed partial class ClaudeSessionService
                 _stepUsage = null;
             }
 
-            var model = GetString(message, "model");
-            if (!string.IsNullOrWhiteSpace(model) && model != "<synthetic>")
+            if (!string.IsNullOrWhiteSpace(model) && model != ClaudeSyntheticModel)
             {
                 _modelId = model;
             }
             _stepStopReason = GetString(message, "stop_reason") ?? _stepStopReason;
-            _stepIsApiError = GetBoolean(record, "isApiErrorMessage");
+            _stepIsApiError = isApiError;
             if (ExtractClaudeUsage(record) is { } usage)
             {
                 _usageByMessage[usage.Key] = usage;
@@ -204,6 +202,11 @@ public sealed partial class ClaudeSessionService
             }
             _assistantSinceIdle = true;
             _lastActivityMs = timestampMs;
+            if (isApiError)
+            {
+                // The text is a notice of Claude Code, not an answer; the turn ends as failed instead.
+                return;
+            }
 
             foreach (var raw in content)
             {
@@ -217,7 +220,7 @@ public sealed partial class ClaudeSessionService
                 switch (GetString(part, "type"))
                 {
                     case "thinking":
-                        if (NonBlank(GetString(part, "thinking")) is { } thinking)
+                        if (options.IncludeThinking && NonBlank(GetString(part, "thinking")) is { } thinking)
                         {
                             OpenStep(timestampMs).Add(new JsonObject { ["type"] = "reasoning", ["text"] = thinking.Trim() });
                         }
@@ -226,13 +229,79 @@ public sealed partial class ClaudeSessionService
                         AddStepText(GetString(part, "text"), timestampMs);
                         break;
                     case "tool_use":
-                        if (includeToolCallResults) AddToolCall(part, timestampMs);
+                        if (options.IncludeToolCallResults) AddToolCall(part, timestampMs);
                         break;
                 }
             }
         }
 
         private void PushUserRecord(JsonObject record, JsonArray content, long timestampMs)
+        {
+            var (texts, files) = CollectUserContent(content, timestampMs);
+            var previousRow = _previousUserRow;
+            _previousUserRow = null;
+            if (texts.Count == 0 && files.Count == 0)
+            {
+                return;
+            }
+
+            var row = ReadClaudeUserRow(record, texts, files.Count > 0, previousRow);
+            _previousUserRow = row.Kind;
+            var previousActivityMs = _lastActivityMs ?? timestampMs;
+            // Rows for Claude Code's own interface are no activity of the conversation.
+            if (row.Kind is not (ClaudeUserRowKind.Housekeeping or ClaudeUserRowKind.LocalCommandCaveat or ClaudeUserRowKind.Interruption))
+            {
+                _lastActivityMs = timestampMs;
+            }
+
+            switch (row.Kind)
+            {
+                case ClaudeUserRowKind.Interruption:
+                    // The marker is not text of the user; the idle marker of the turn carries the outcome.
+                    if (_assistantSinceIdle || _promptSinceIdle)
+                    {
+                        EndTurn(previousActivityMs, "interrupted");
+                    }
+                    else
+                    {
+                        CloseStep();
+                    }
+                    break;
+                case ClaudeUserRowKind.CompactSummary:
+                    CloseStep();
+                    Enqueue(NewMessage("compaction", timestampMs, message =>
+                    {
+                        message["status"] = "completed";
+                        message["reason"] = _compactionReason;
+                        message["summary"] = row.Text;
+                    }));
+                    _compactionReason = "auto";
+                    break;
+                case ClaudeUserRowKind.DelegatedWork:
+                    // Follows the option for tool calls, like the tool result it stands for.
+                    EndFinishedTurn(previousActivityMs);
+                    if (options.IncludeToolCallResults) EnqueueSynthetic(row.Text, timestampMs);
+                    break;
+                case ClaudeUserRowKind.HostTurn:
+                    EndFinishedTurn(previousActivityMs);
+                    EnqueueSynthetic(row.Text, timestampMs);
+                    break;
+                case ClaudeUserRowKind.ToolCompanion:
+                    // A loaded skill or the scale of a screenshot only matters together with the tool calls.
+                    if (options.IncludeToolCallResults) PushInjectedText(row.Text, timestampMs);
+                    break;
+                case ClaudeUserRowKind.Injected:
+                    PushInjectedText(row.Text, timestampMs);
+                    break;
+                case ClaudeUserRowKind.Prompt:
+                case ClaudeUserRowKind.SlashCommand:
+                    PushPrompt(row, files, timestampMs, previousActivityMs);
+                    break;
+            }
+        }
+
+        // The texts and the embedded images of a user row. Tool results in the row go to their tool calls.
+        private (List<string> Texts, JsonArray Files) CollectUserContent(JsonArray content, long timestampMs)
         {
             var texts = new List<string>();
             var files = new JsonArray();
@@ -247,13 +316,13 @@ public sealed partial class ClaudeSessionService
                 if (raw is not JsonObject part) continue;
                 if (GetString(part, "type") == "tool_result")
                 {
-                    if (includeToolCallResults) AttachToolResult(part, timestampMs);
+                    if (options.IncludeToolCallResults) AttachToolResult(part, timestampMs);
                     continue;
                 }
 
                 if (LooksLikeImageContentPart(part))
                 {
-                    if (includeImages && ReadImage(part) is { } image)
+                    if (options.IncludeImages && ReadImage(part) is { } image)
                     {
                         files.Add(new JsonObject
                         {
@@ -270,58 +339,12 @@ public sealed partial class ClaudeSessionService
                 if (!string.IsNullOrWhiteSpace(text)) texts.Add(text);
             }
 
-            var promptText = string.Join("\n\n", texts);
-            if (promptText.Length == 0 && files.Count == 0)
-            {
-                return;
-            }
+            return (texts, files);
+        }
 
-            var previousActivityMs = _lastActivityMs ?? timestampMs;
-            _lastActivityMs = timestampMs;
-            if (GetBoolean(record, "isCompactSummary"))
-            {
-                CloseStep();
-                Enqueue(NewMessage("compaction", timestampMs, message =>
-                {
-                    message["status"] = "completed";
-                    message["reason"] = _compactionReason;
-                    message["summary"] = promptText;
-                }));
-                _compactionReason = "auto";
-                return;
-            }
-
-            if (GetBoolean(record, "isMeta"))
-            {
-                // Text that Claude Code added for the model, not something the user typed.
-                if (promptText.Length == 0) return;
-                CloseStep();
-                Enqueue(NewMessage("synthetic", timestampMs, message => message["text"] = promptText));
-                return;
-            }
-
-            var taskNotification = IsClaudeTaskNotification(record, promptText);
-            if (taskNotification || IsClaudeHostTurn(record))
-            {
-                // Such a row starts a turn of its own once the previous response has finished.
-                if (_assistantSinceIdle && _stepStopReason is not (null or "tool_use" or "pause_turn"))
-                {
-                    EndTurn(previousActivityMs, _stepIsApiError ? "failed" : "succeeded");
-                }
-                else
-                {
-                    CloseStep();
-                }
-
-                // A task notification follows the option for tool calls, like the tool result it stands for.
-                if (promptText.Length > 0 && (!taskNotification || includeToolCallResults))
-                {
-                    Enqueue(NewMessage("synthetic", timestampMs, message => message["text"] = promptText));
-                }
-                return;
-            }
-
-            if (!_sawFirstUserMessage && LooksLikeBootstrapContext(promptText))
+        private void PushPrompt(ClaudeUserRow row, JsonArray files, long timestampMs, long previousActivityMs)
+        {
+            if (!_sawFirstUserMessage && LooksLikeBootstrapContext(row.Text))
             {
                 _sawFirstUserMessage = true;
                 return;
@@ -330,7 +353,7 @@ public sealed partial class ClaudeSessionService
             _sawFirstUserMessage = true;
             if (_assistantSinceIdle)
             {
-                var outcome = promptText.StartsWith(UserInterruptionPrefix, StringComparison.Ordinal) || _pendingCalls.Count > 0
+                var outcome = row.Text.StartsWith(ClaudeInterruptionPrefix, StringComparison.Ordinal) || _pendingCalls.Count > 0
                     ? "interrupted"
                     : _stepIsApiError ? "failed" : "succeeded";
                 EndTurn(previousActivityMs, outcome);
@@ -340,13 +363,43 @@ public sealed partial class ClaudeSessionService
                 CloseStep();
             }
 
-            _firstPromptText ??= NonBlank(promptText);
+            // A reminder of the host in front of the typed text is not text of the user.
+            EnqueueSynthetic(row.InjectedText, timestampMs);
+            _firstPromptText ??= NonBlank(row.Text);
             _promptSinceIdle = true;
             Enqueue(NewMessage("user", timestampMs, message =>
             {
-                message["text"] = promptText;
+                message["text"] = row.Text;
                 if (files.Count > 0) message["files"] = files;
             }));
+        }
+
+        // A row of the host or about delegated work starts a turn of its own once the previous response has finished.
+        private void EndFinishedTurn(long timestampMs)
+        {
+            if (_assistantSinceIdle && _stepStopReason is not (null or "tool_use" or "pause_turn"))
+            {
+                EndTurn(timestampMs, _stepIsApiError ? "failed" : "succeeded");
+            }
+            else
+            {
+                CloseStep();
+            }
+        }
+
+        // Text that Claude Code added for the model in the middle of a turn.
+        private void PushInjectedText(string text, long timestampMs)
+        {
+            CloseStep();
+            EnqueueSynthetic(text, timestampMs);
+        }
+
+        private void EnqueueSynthetic(string text, long timestampMs)
+        {
+            if (text.Length > 0)
+            {
+                Enqueue(NewMessage("synthetic", timestampMs, message => message["text"] = text));
+            }
         }
 
         private void AddStepText(string? text, long timestampMs)
@@ -444,15 +497,21 @@ public sealed partial class ClaudeSessionService
                     AddText(text);
                     break;
                 case JsonArray array:
+                    var loadedTools = new List<string>();
                     foreach (var raw in array)
                     {
                         if (raw is JsonValue item && item.TryGetValue<string>(out var itemText))
                         {
                             AddText(itemText);
                         }
+                        else if (raw is JsonObject reference && GetString(reference, "type") == "tool_reference")
+                        {
+                            // The tool search answers with one reference per tool that it loaded.
+                            if (NonBlank(GetString(reference, "tool_name")) is { } toolName) loadedTools.Add(toolName);
+                        }
                         else if (raw is JsonObject part && LooksLikeImageContentPart(part))
                         {
-                            if (includeImages && ReadImage(part) is { } image)
+                            if (options.IncludeImages && ReadImage(part) is { } image)
                             {
                                 content.Add(new JsonObject
                                 {
@@ -468,6 +527,8 @@ public sealed partial class ClaudeSessionService
                             AddText(GetString(other, "type") == "text" ? GetString(other, "text") : other.ToJsonString(CompactJsonOptions));
                         }
                     }
+
+                    if (loadedTools.Count > 0) AddText($"Loaded tools: {string.Join(", ", loadedTools)}");
                     break;
                 case not null:
                     AddText(node.ToJsonString(CompactJsonOptions));

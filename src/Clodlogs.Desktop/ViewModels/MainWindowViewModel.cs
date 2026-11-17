@@ -57,6 +57,7 @@ public sealed class MainWindowViewModel : ViewModelBase
     private bool _exportImages;
     private bool _exportInlineImages = true;
     private bool _exportToolCallResults;
+    private bool _exportThinking;
     private string _batchExportDirectory = "";
     private bool _updatingBatchSelection;
     private string _operationTitle = "Ready";
@@ -515,7 +516,7 @@ public sealed class MainWindowViewModel : ViewModelBase
 
     public bool ExportFormatHintVisible => ExportFormat == ClaudeSessionService.OpenCodeExportFormat;
     public string ExportFormatHint => ExportFormatHintVisible
-        ? "Writes a session file for OpenCode 2. To import it in OpenCode, open the ⋯ menu of a project in the sidebar and choose Import session, or run: opencode session import <file>. Images are embedded in the file. Include tool calls when the session is meant to be continued."
+        ? "Writes a session file for OpenCode 2. To import it in OpenCode, open the ⋯ menu of a project in the sidebar and choose Import session, or run: opencode session import <file>. Images are embedded in the file. Include tool calls when the session is meant to be continued. Interruption markers, local commands such as /model and API error messages are left out."
         : "";
 
     public string BatchExportDirectory
@@ -552,6 +553,15 @@ public sealed class MainWindowViewModel : ViewModelBase
         get => _exportToolCallResults;
         set => SetProperty(ref _exportToolCallResults, value);
     }
+
+    public bool ExportThinking
+    {
+        get => _exportThinking;
+        set => SetProperty(ref _exportThinking, value);
+    }
+
+    private SessionExportOptions ExportOptions
+        => new(ExportImages, ExportInlineImages, ExportToolCallResults, ExportThinking);
 
     public string OperationTitle
     {
@@ -1151,7 +1161,7 @@ public sealed class MainWindowViewModel : ViewModelBase
         OperationStage = "starting";
         OperationProgress = 2;
         OperationOutputPath = null;
-        var jobId = _sessions.StartExportJob(ExportFormat, SelectedSession.File, ExportImages, ExportInlineImages, ExportToolCallResults, outputDirectory, outputPath).JobId;
+        var jobId = _sessions.StartExportJob(ExportFormat, SelectedSession.File, ExportOptions, outputDirectory, outputPath).JobId;
         SetActiveOperation("export", jobId);
         try
         {
@@ -1246,9 +1256,7 @@ public sealed class MainWindowViewModel : ViewModelBase
         var jobId = _sessions.StartBatchExportJob(
             ExportFormat,
             selected,
-            ExportImages,
-            ExportInlineImages,
-            ExportToolCallResults,
+            ExportOptions,
             outputDirectory).JobId;
         SetActiveOperation("batch", jobId);
         try

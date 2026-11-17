@@ -21,6 +21,9 @@ var tests = new List<(string Name, Func<Task> Run)>
     ("opencode export embeds only valid inline images", TestOpenCodeExportImagesAsync),
     ("opencode batch export names files and repeats identifiers", TestOpenCodeBatchExportAsync),
     ("task notifications follow the tool option and are not prompts", TestTaskNotificationsAsync),
+    ("opencode export leaves out markers, local commands and error notices", TestOpenCodeExportLeavesOutClaudeCodeRowsAsync),
+    ("opencode export splits host text from prompts and keeps turn ends", TestOpenCodeExportSplitsHostTextFromPromptsAsync),
+    ("thinking is exported only when requested", TestThinkingOptionAsync),
     ("opencode identifiers follow the layout of OpenCode 2.3", TestOpenCodeIdentifiers),
     ("single export avoids automatic filename collisions", TestSingleExportCollisionsAsync),
     ("failed export preserves existing output and reports image I/O errors", TestFailedExportPreservesOutputAsync),
@@ -232,7 +235,7 @@ static async Task TestMarkdownExportResponseItemsAndImagesAsync()
     var outputDirectory = Path.Combine(fixture.Root, "export");
     Directory.CreateDirectory(outputDirectory);
     var service = new ClaudeSessionService();
-    var job = service.StartExportJob("markdown", sessionPath, includeImages: true, inlineImages: false, includeToolCallResults: true, outputDirectory, outputPath: null);
+    var job = service.StartExportJob("markdown", sessionPath, new(true, false, true), outputDirectory, outputPath: null);
     var status = await WaitForExportAsync(() => service.GetExportJobStatus(job.JobId));
 
     AssertEqual("success", status.Kind, "export status");
@@ -264,14 +267,14 @@ static async Task TestNativeClaudeToolOptionsAsync()
         string outputPath;
         if (batch)
         {
-            var job = service.StartBatchExportJob(format, [new(sessionPath, "Native", null)], false, false, includeTools, outputDirectory);
+            var job = service.StartBatchExportJob(format, [new(sessionPath, "Native", null)], new(false, false, includeTools, IncludeThinking: true), outputDirectory);
             var status = await WaitForBatchExportAsync(() => service.GetBatchExportJobStatus(job.JobId));
             AssertEqual("success", status.Kind, "native batch export");
             outputPath = Directory.GetFiles(outputDirectory).Single();
         }
         else
         {
-            var job = service.StartExportJob(format, sessionPath, false, false, includeTools, outputDirectory, null);
+            var job = service.StartExportJob(format, sessionPath, new(false, false, includeTools, IncludeThinking: true), outputDirectory, null);
             var status = await WaitForExportAsync(() => service.GetExportJobStatus(job.JobId));
             AssertEqual("success", status.Kind, "native single export");
             outputPath = status.OutputPath!;
@@ -321,7 +324,7 @@ static async Task TestNativeClaudeImageOptionsAsync()
             {"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"image-call","content":[{"type":"text","text":"IMAGE-TOOL-RESULT"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"d29ybGQ="}}]}]}}
             """);
         var service = new ClaudeSessionService();
-        var job = service.StartExportJob(format, sessionPath, includeImages, inlineImages, includeTools, fixture.Root, null);
+        var job = service.StartExportJob(format, sessionPath, new(includeImages, inlineImages, includeTools), fixture.Root, null);
         var status = await WaitForExportAsync(() => service.GetExportJobStatus(job.JobId));
         AssertEqual("success", status.Kind, "native image export");
         var exported = await File.ReadAllTextAsync(status.OutputPath!);
@@ -365,7 +368,7 @@ static async Task TestApiRequestRowsAreNotTranscriptAsync()
 
     foreach (var format in new[] { "markdown", "html", "opencode" })
     {
-        var job = service.StartExportJob(format, sessionPath, false, false, true, Path.Combine(fixture.Root, format), null);
+        var job = service.StartExportJob(format, sessionPath, new(false, false, true), Path.Combine(fixture.Root, format), null);
         var status = await WaitForExportAsync(() => service.GetExportJobStatus(job.JobId));
         AssertEqual("success", status.Kind, $"{format} export");
         var exported = await File.ReadAllTextAsync(status.OutputPath!);
@@ -407,10 +410,10 @@ static string WriteOpenCodeSourceSession(TempFixture fixture)
         .Replace("@image@", image.Trim()));
 }
 
-static async Task<JsonObject> ExportOpenCodeAsync(string sessionPath, string outputDirectory, bool includeImages, bool includeTools)
+static async Task<JsonObject> ExportOpenCodeAsync(string sessionPath, string outputDirectory, bool includeImages, bool includeTools, bool includeThinking = false)
 {
     var service = new ClaudeSessionService();
-    var job = service.StartExportJob("opencode", sessionPath, includeImages, false, includeTools, outputDirectory, null);
+    var job = service.StartExportJob("opencode", sessionPath, new(includeImages, false, includeTools, includeThinking), outputDirectory, null);
     var status = await WaitForExportAsync(() => service.GetExportJobStatus(job.JobId));
     AssertEqual("success", status.Kind, $"opencode export: {status.Message}");
     AssertTrue(status.OutputPath!.EndsWith(".opencode.json", StringComparison.Ordinal), "opencode export file suffix");
@@ -524,7 +527,7 @@ static JsonArray OpenCodeMessagesWithoutIds(JsonObject data)
 static async Task TestOpenCodeExportTranscriptAsync()
 {
     using var fixture = new TempFixture();
-    var data = await ExportOpenCodeAsync(WriteOpenCodeSourceSession(fixture), fixture.Root, includeImages: true, includeTools: true);
+    var data = await ExportOpenCodeAsync(WriteOpenCodeSourceSession(fixture), fixture.Root, includeImages: true, includeTools: true, includeThinking: true);
 
     AssertJsonEqual(OpenCodeJson("""
         [
@@ -573,7 +576,8 @@ static async Task TestOpenCodeExportOptionsAsync()
     var messages = (JsonArray)data["messages"]!;
     AssertEqual("user,assistant,assistant,idle", string.Join(",", messages.Select(message => message!["type"]!.GetValue<string>())), "message types without tools");
     AssertTrue(messages[0]!["files"] is null, "prompt has no attachments");
-    AssertEqual("reasoning,text", string.Join(",", ((JsonArray)messages[1]!["content"]!).Select(part => part!["type"]!.GetValue<string>())), "response keeps reasoning and text");
+    AssertEqual("text", string.Join(",", ((JsonArray)messages[1]!["content"]!).Select(part => part!["type"]!.GetValue<string>())), "response keeps its text");
+    AssertTrue(!exported.Contains("Plan the fix", StringComparison.Ordinal), "excluded thinking never leaks");
     // The token totals do not depend on the options.
     AssertEqual(43L, data["info"]!["tokens"]!["output"]!.GetValue<long>(), "output tokens");
 }
@@ -605,12 +609,8 @@ static async Task TestOpenCodeExportTurnsAsync()
              "time":{"created":@t2@,"ran":@t2@,"completed":@t2@}}],
            "finish":"tool-calls"},
           {"type":"idle","time":{"created":@t2@},"outcome":"interrupted"},
-          {"type":"user","time":{"created":@t3@},"text":"[Request interrupted by user for tool use]"},
-          {"type":"synthetic","time":{"created":@t4@},"text":"<local-command-caveat>Caveat</local-command-caveat>"},
           {"type":"compaction","time":{"created":@t6@},"status":"completed","reason":"manual","summary":"Summary of the work so far"},
           {"type":"user","time":{"created":@t7@},"text":"Second"},
-          {"type":"assistant","time":{"created":@t8@,"completed":@t8@},"agent":"build","model":@model@,
-           "content":[{"type":"text","text":"API Error: 500"}],"finish":"error"},
           {"type":"idle","time":{"created":@t8@},"outcome":"failed"},
           {"type":"user","time":{"created":@t9@},"text":"Third"},
           {"type":"idle","time":{"created":@t9@},"outcome":"interrupted"}
@@ -646,7 +646,7 @@ static async Task TestOpenCodeBatchExportAsync()
 
     // Images are embedded, so an asset folder of the same name does not force another file name.
     Directory.CreateDirectory(Path.Combine(outputDirectory, "Bug fix - 2026-11-17T10-00-02.000Z.opencode-assets"));
-    var job = service.StartBatchExportJob("opencode", [new(sessionPath, "Bug fix", "2026-11-17T10:00:02Z"), new(sessionPath, "Bug fix", "2026-11-17T10:00:02Z")], true, false, true, outputDirectory);
+    var job = service.StartBatchExportJob("opencode", [new(sessionPath, "Bug fix", "2026-11-17T10:00:02Z"), new(sessionPath, "Bug fix", "2026-11-17T10:00:02Z")], new(true, false, true), outputDirectory);
     var status = await WaitForBatchExportAsync(() => service.GetBatchExportJobStatus(job.JobId));
     AssertEqual("success", status.Kind, $"opencode batch export: {status.Message}");
     var files = Directory.GetFiles(outputDirectory).Select(Path.GetFileName).Order(StringComparer.Ordinal).ToArray();
@@ -696,7 +696,7 @@ static async Task TestTaskNotificationsAsync()
     foreach (var format in new[] { "markdown", "html" })
     foreach (var includeTools in new[] { false, true })
     {
-        var job = service.StartExportJob(format, sessionPath, false, false, includeTools, Path.Combine(fixture.Root, $"{format}-{includeTools}"), null);
+        var job = service.StartExportJob(format, sessionPath, new(false, false, includeTools), Path.Combine(fixture.Root, $"{format}-{includeTools}"), null);
         var status = await WaitForExportAsync(() => service.GetExportJobStatus(job.JobId));
         AssertEqual("success", status.Kind, $"{format} export");
         var exported = await File.ReadAllTextAsync(status.OutputPath!);
@@ -721,6 +721,144 @@ static async Task TestTaskNotificationsAsync()
     AssertEqual(OpenCodeTime(2), withTools["messages"]![2]!["time"]!["created"]!.GetValue<long>(), "the turn before a notification ends with its last response");
 }
 
+static async Task TestOpenCodeExportLeavesOutClaudeCodeRowsAsync()
+{
+    using var fixture = new TempFixture();
+    // Rows that Claude Code writes around the conversation: markers, local commands, loaded skills, notes about images.
+    var sessionPath = fixture.WriteSession("""
+        {"type":"user","sessionId":"claude-session-4","cwd":"C:\\repo","timestamp":"2026-11-17T10:00:01Z","origin":{"kind":"human"},"turnOrigin":"human","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>\nREMINDER-MARKER\n</system-reminder>"},{"type":"text","text":"Typed prompt"}]}}
+        {"type":"assistant","timestamp":"2026-11-17T10:00:02Z","message":{"id":"msg_a","role":"assistant","model":"claude-test","stop_reason":"end_turn","content":[{"type":"text","text":"Answer one."}]}}
+        {"type":"user","isMeta":true,"timestamp":"2026-11-17T10:00:03Z","message":{"role":"user","content":"<local-command-caveat>Caveat: The messages below were generated by the user while running local commands.</local-command-caveat>"}}
+        {"type":"user","timestamp":"2026-11-17T10:00:03Z","message":{"role":"user","content":"<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>claude-other</command-args>"}}
+        {"type":"user","timestamp":"2026-11-17T10:00:03Z","message":{"role":"user","content":"<local-command-stdout>Set model to claude-other</local-command-stdout>"}}
+        {"type":"assistant","timestamp":"2026-11-17T10:00:04Z","message":{"id":"msg_none_1","role":"assistant","model":"<synthetic>","stop_reason":"stop_sequence","content":[{"type":"text","text":"No response requested."}]}}
+        {"type":"user","timestamp":"2026-11-17T10:00:05Z","message":{"role":"user","content":"<command-message>loop</command-message>\n<command-name>/loop</command-name>\n<command-args>5m check the build</command-args>"}}
+        {"type":"user","isMeta":true,"timestamp":"2026-11-17T10:00:05Z","message":{"role":"user","content":[{"type":"text","text":"# /loop\n\nEXPANSION-MARKER"}]}}
+        {"type":"assistant","timestamp":"2026-11-17T10:00:06Z","message":{"id":"msg_b","role":"assistant","model":"claude-test","stop_reason":"tool_use","content":[{"type":"tool_use","id":"call_1","name":"Skill","input":{"skill":"review"}}]}}
+        {"type":"user","timestamp":"2026-11-17T10:00:07Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"Launching skill: review"}]}}
+        {"type":"user","isMeta":true,"sourceToolUseID":"call_1","timestamp":"2026-11-17T10:00:07Z","message":{"role":"user","content":[{"type":"text","text":"Base directory for this skill: C:\\skills\\review\n\nSKILL-BODY-MARKER"}]}}
+        {"type":"assistant","timestamp":"2026-11-17T10:00:08Z","message":{"id":"msg_c","role":"assistant","model":"claude-test","stop_reason":"tool_use","content":[{"type":"tool_use","id":"call_2","name":"ToolSearch","input":{"query":"one two"}}]}}
+        {"type":"user","timestamp":"2026-11-17T10:00:09Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_2","content":[{"type":"tool_reference","tool_name":"mcp__a__one"},{"type":"tool_reference","tool_name":"mcp__a__two"}]}]}}
+        {"type":"assistant","timestamp":"2026-11-17T10:00:10Z","message":{"id":"msg_d","role":"assistant","model":"claude-test","stop_reason":"tool_use","content":[{"type":"tool_use","id":"call_3","name":"screenshot","input":{}}]}}
+        {"type":"user","timestamp":"2026-11-17T10:00:11Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_3","content":[{"type":"text","text":"captured"}]}]}}
+        {"type":"user","isMeta":true,"timestamp":"2026-11-17T10:00:11Z","message":{"role":"user","content":[{"type":"text","text":"[Image: original 2082x1504, displayed at 2000x1445. Multiply coordinates by 1.04 to map to original image.]"}]}}
+        {"type":"assistant","timestamp":"2026-11-17T10:00:12Z","message":{"id":"msg_e","role":"assistant","model":"claude-test","stop_reason":"end_turn","content":[{"type":"text","text":"Answer two."}]}}
+        {"type":"user","timestamp":"2026-11-17T10:00:13Z","origin":{"kind":"human"},"message":{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}},{"type":"text","text":"Look at this"}]}}
+        {"type":"user","isMeta":true,"timestamp":"2026-11-17T10:00:13Z","message":{"role":"user","content":[{"type":"text","text":"[Image: source: C:\\Temp\\images\\1.png]"}]}}
+        {"type":"assistant","timestamp":"2026-11-17T10:00:14Z","message":{"id":"msg_f","role":"assistant","model":"claude-test","stop_reason":null,"content":[{"type":"text","text":"Working on it"}]}}
+        {"type":"user","timestamp":"2026-11-17T10:00:15Z","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}
+        {"type":"assistant","timestamp":"2026-11-17T10:00:16Z","message":{"id":"msg_none_2","role":"assistant","model":"<synthetic>","stop_reason":"stop_sequence","content":[{"type":"text","text":"No response requested."}]}}
+        {"type":"user","isMeta":true,"timestamp":"2026-11-17T10:00:17Z","message":{"role":"user","content":"Continue from where you left off."}}
+        {"type":"user","isMeta":true,"timestamp":"2026-11-17T10:00:18Z","message":{"role":"user","content":"<system-reminder>\n<tools-used-before-summary>Grep, Read</tools-used-before-summary>\n</system-reminder>"}}
+        {"type":"user","isMeta":true,"timestamp":"2026-11-17T10:00:19Z","origin":{"kind":"peer"},"turnOrigin":"peer","message":{"role":"user","content":"Another Claude session sent a message: PEER-MARKER"}}
+        {"type":"assistant","timestamp":"2026-11-17T10:00:20Z","message":{"id":"msg_g","role":"assistant","model":"claude-test","stop_reason":"end_turn","content":[{"type":"text","text":"Noted."}]}}
+        {"type":"user","timestamp":"2026-11-17T10:00:21Z","message":{"role":"user","content":"<command-name>/goal</command-name>\n<command-message>goal</command-message>\n<command-args>finish the port</command-args>"}}
+        {"type":"user","timestamp":"2026-11-17T10:00:21Z","message":{"role":"user","content":"<local-command-stdout>Goal set: finish the port</local-command-stdout>"}}
+        {"type":"assistant","isApiErrorMessage":true,"timestamp":"2026-11-17T10:00:22Z","message":{"id":"msg_error","role":"assistant","model":"<synthetic>","stop_reason":"stop_sequence","content":[{"type":"text","text":"API Error: 529 Overloaded."}]}}
+        """);
+
+    var metrics = await new ClaudeSessionService().GetSessionDetailMetricsAsync(sessionPath, false);
+    AssertEqual(4, metrics.InteractionCount, "markers, local commands and their output are not prompts");
+
+    static string MessageTypes(JsonObject data) => string.Join(",", ((JsonArray)data["messages"]!).Select(message => message!["type"]!.GetValue<string>()));
+    static string[] Texts(JsonObject data, string type) => ((JsonArray)data["messages"]!)
+        .Where(message => message!["type"]!.GetValue<string>() == type)
+        .Select(message => message!["text"]!.GetValue<string>())
+        .ToArray();
+    var alwaysLeftOut = new[] { "local-command", "/model", "No response requested", "Request interrupted", "Image: source", "Continue from where", "tools-used-before-summary", "API Error", "tool_reference", "command-name" };
+    var onlyWithToolCalls = new[] { "EXPANSION-MARKER", "SKILL-BODY-MARKER", "Image: original", "PEER-MARKER", "Loaded tools: mcp__a__one, mcp__a__two" };
+
+    foreach (var includeTools in new[] { false, true })
+    {
+        var data = await ExportOpenCodeAsync(sessionPath, Path.Combine(fixture.Root, $"tools-{includeTools}"), includeImages: false, includeTools);
+        var exported = data.ToJsonString(new System.Text.Json.JsonSerializerOptions { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping });
+        foreach (var marker in alwaysLeftOut)
+        {
+            AssertTrue(!exported.Contains(marker, StringComparison.Ordinal), $"tools={includeTools}: {marker} is left out");
+        }
+        foreach (var marker in onlyWithToolCalls)
+        {
+            AssertEqual(includeTools, exported.Contains(marker, StringComparison.Ordinal), $"tools={includeTools}: {marker}");
+        }
+
+        // A command of the user reads as typed; text of the host inside a prompt row is injected text.
+        AssertEqual("Typed prompt|/loop 5m check the build|Look at this|/goal finish the port", string.Join("|", Texts(data, "user")), $"tools={includeTools}: prompts");
+        AssertEqual("<system-reminder>\nREMINDER-MARKER\n</system-reminder>", Texts(data, "synthetic")[0], $"tools={includeTools}: reminder in front of a prompt");
+        AssertEqual(
+            includeTools
+                ? "synthetic,user,assistant,idle,user,synthetic,assistant,synthetic,assistant,assistant,synthetic,assistant,idle,user,assistant,idle,synthetic,assistant,idle,user,idle"
+                : "synthetic,user,assistant,idle,user,assistant,idle,user,assistant,idle,assistant,idle,user,idle",
+            MessageTypes(data),
+            $"tools={includeTools}: message types");
+        AssertEqual(
+            "succeeded,succeeded,interrupted,succeeded,failed",
+            string.Join(",", ((JsonArray)data["messages"]!).Where(message => message!["type"]!.GetValue<string>() == "idle").Select(message => message!["outcome"]!.GetValue<string>())),
+            $"tools={includeTools}: the idle markers carry interruptions and failures");
+        AssertEqual("failed", data["info"]!["outcome"]!.GetValue<string>(), $"tools={includeTools}: outcome of a session that ends with an API error");
+    }
+}
+
+static async Task TestOpenCodeExportSplitsHostTextFromPromptsAsync()
+{
+    using var fixture = new TempFixture();
+    var sessionPath = fixture.WriteSession("""
+        {"type":"user","sessionId":"claude-session-5","cwd":"C:\\repo","timestamp":"2026-11-17T10:00:01Z","message":{"role":"user","content":[{"type":"text","text":"<ide_opened_file>The user opened the file C:\\repo\\a.cs in the IDE.</ide_opened_file>"},{"type":"text","text":"Explain this file"}]}}
+        {"type":"assistant","timestamp":"2026-11-17T10:00:02Z","message":{"id":"msg_a","role":"assistant","model":"claude-test","stop_reason":"end_turn","content":[{"type":"text","text":"It parses rows."}]}}
+        {"type":"user","isSidechain":true,"timestamp":"2026-11-17T10:00:02Z","message":{"role":"user","content":"SUBAGENT-PROMPT"}}
+        {"type":"user","timestamp":"2026-11-17T10:00:03Z","origin":{"kind":"human"},"turnOrigin":"human","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>\nFORK-NOTE\n</system-reminder>"}]}}
+        {"type":"assistant","timestamp":"2026-11-17T10:00:04Z","message":{"id":"msg_b","role":"assistant","model":"claude-test","stop_reason":"end_turn","content":[{"type":"text","text":"Noted the fork."}]}}
+        {"type":"user","timestamp":"2026-11-17T10:00:05Z","message":{"role":"user","content":"[Request interrupted by user]\nand now do the other thing"}}
+        {"type":"assistant","timestamp":"2026-11-17T10:00:06Z","message":{"id":"msg_c","role":"assistant","model":"claude-test","stop_reason":"end_turn","content":[{"type":"thinking","thinking":"THINK-ONLY"}]}}
+        {"type":"user","timestamp":"2026-11-17T10:00:07Z","message":{"role":"user","content":"<local-command-stderr>Unknown command</local-command-stderr>"}}
+        {"type":"user","timestamp":"2026-11-17T10:00:08Z","message":{"role":"user","content":"Thanks"}}
+        """);
+
+    var metrics = await new ClaudeSessionService().GetSessionDetailMetricsAsync(sessionPath, false);
+    AssertEqual(3, metrics.InteractionCount, "a reminder without a prompt, a subagent prompt and command output are not prompts");
+
+    var data = await ExportOpenCodeAsync(sessionPath, fixture.Root, includeImages: false, includeTools: false);
+    AssertJsonEqual(OpenCodeJson("""
+        [
+          {"type":"synthetic","time":{"created":@t1@},"text":"<ide_opened_file>The user opened the file C:\\repo\\a.cs in the IDE.</ide_opened_file>"},
+          {"type":"user","time":{"created":@t1@},"text":"Explain this file"},
+          {"type":"assistant","time":{"created":@t2@,"completed":@t2@},"agent":"build","model":@model@,"content":[{"type":"text","text":"It parses rows."}],"finish":"stop"},
+          {"type":"idle","time":{"created":@t2@},"outcome":"succeeded"},
+          {"type":"synthetic","time":{"created":@t3@},"text":"<system-reminder>\nFORK-NOTE\n</system-reminder>"},
+          {"type":"assistant","time":{"created":@t4@,"completed":@t4@},"agent":"build","model":@model@,"content":[{"type":"text","text":"Noted the fork."}],"finish":"stop"},
+          {"type":"idle","time":{"created":@t4@},"outcome":"interrupted"},
+          {"type":"user","time":{"created":@t5@},"text":"[Request interrupted by user]\nand now do the other thing"},
+          {"type":"idle","time":{"created":@t6@},"outcome":"succeeded"},
+          {"type":"user","time":{"created":@t8@},"text":"Thanks"},
+          {"type":"idle","time":{"created":@t8@},"outcome":"interrupted"}
+        ]
+        """), OpenCodeMessagesWithoutIds(data), "host text, a marker with text behind it and a response of thinking only");
+    AssertEqual("Explain this file", data["info"]!["title"]!.GetValue<string>(), "the title comes from the typed text");
+}
+
+static async Task TestThinkingOptionAsync()
+{
+    using var fixture = new TempFixture();
+    var sessionPath = WriteNativeClaudeSession(fixture);
+    var service = new ClaudeSessionService();
+    foreach (var format in new[] { "markdown", "html", "opencode" })
+    foreach (var includeThinking in new[] { false, true })
+    {
+        var job = service.StartExportJob(format, sessionPath, new(false, false, true, includeThinking), Path.Combine(fixture.Root, $"{format}-{includeThinking}"), null);
+        var status = await WaitForExportAsync(() => service.GetExportJobStatus(job.JobId));
+        AssertEqual("success", status.Kind, $"{format} export");
+        var exported = await File.ReadAllTextAsync(status.OutputPath!);
+        AssertEqual(includeThinking, exported.Contains("THINKING-MARKER", StringComparison.Ordinal), $"{format}, thinking={includeThinking}");
+        AssertContains("BEFORE-TOOL", exported, "the answer stays");
+        if (format != "opencode")
+        {
+            AssertContains($"Included thinking:{(format == "html" ? "</strong>" : "")} {(includeThinking ? "yes" : "no")}", exported, $"{format} header names the option");
+        }
+    }
+
+    // The option is off unless it is asked for.
+    AssertTrue(!new SessionExportOptions(true, true, true).IncludeThinking, "thinking is excluded by default");
+}
+
 static async Task TestSingleExportCollisionsAsync()
 {
     foreach (var format in new[] { "markdown", "html" })
@@ -730,7 +868,7 @@ static async Task TestSingleExportCollisionsAsync()
         var originalPath = Path.Combine(fixture.Root, format == "html" ? "sample.html" : "sample.md");
         await File.WriteAllTextAsync(originalPath, "EXISTING-EXPORT");
         var service = new ClaudeSessionService();
-        var job = service.StartExportJob(format, sessionPath, false, false, false, fixture.Root, null);
+        var job = service.StartExportJob(format, sessionPath, new(false, false, false), fixture.Root, null);
         var status = await WaitForExportAsync(() => service.GetExportJobStatus(job.JobId));
         AssertEqual("success", status.Kind, "collision export status");
         AssertEqual("EXISTING-EXPORT", await File.ReadAllTextAsync(originalPath), "automatic export preserves existing file");
@@ -750,7 +888,7 @@ static async Task TestFailedExportPreservesOutputAsync()
         await File.WriteAllTextAsync(outputPath, "EXISTING-EXPORT");
         await File.WriteAllTextAsync(Path.Combine(fixture.Root, "existing-assets"), "ASSET-PATH-BLOCKED");
         var service = new ClaudeSessionService();
-        var job = service.StartExportJob(format, sessionPath, true, false, true, null, outputPath);
+        var job = service.StartExportJob(format, sessionPath, new(true, false, true), null, outputPath);
         var status = await WaitForExportAsync(() => service.GetExportJobStatus(job.JobId));
         AssertEqual("error", status.Kind, "image I/O failure is reported");
         AssertEqual("EXISTING-EXPORT", await File.ReadAllTextAsync(outputPath), "failed replacement preserves existing export");
@@ -768,7 +906,7 @@ static async Task TestImageAssetLinksAsync()
     var assetName = "image path (one)#-assets";
     Directory.CreateDirectory(Path.Combine(fixture.Root, assetName, "image-001.png"));
     var service = new ClaudeSessionService();
-    var job = service.StartExportJob("markdown", sessionPath, true, false, false, null, outputPath);
+    var job = service.StartExportJob("markdown", sessionPath, new(true, false, false), null, outputPath);
     var status = await WaitForExportAsync(() => service.GetExportJobStatus(job.JobId));
     AssertEqual("success", status.Kind, "asset directory collision is skipped");
     var exported = await File.ReadAllTextAsync(outputPath);
@@ -782,7 +920,7 @@ static Task TestInvalidExportFormat()
     var service = new ClaudeSessionService();
     try
     {
-        service.StartExportJob("invalid", WriteNativeClaudeSession(fixture), false, false, false, fixture.Root, null);
+        service.StartExportJob("invalid", WriteNativeClaudeSession(fixture), new(false, false, false), fixture.Root, null);
     }
     catch (ArgumentException)
     {
@@ -806,7 +944,7 @@ static async Task TestExplicitExportReplacementAsync()
         var unrelatedAsset = Path.Combine(assets, "image-001.png");
         await File.WriteAllTextAsync(unrelatedAsset, "PREVIOUS-ASSET");
         var service = new ClaudeSessionService();
-        var job = service.StartExportJob(format, sessionPath, true, false, false, null, outputPath);
+        var job = service.StartExportJob(format, sessionPath, new(true, false, false), null, outputPath);
         var status = await WaitForExportAsync(() => service.GetExportJobStatus(job.JobId));
         AssertEqual("success", status.Kind, "explicit replacement succeeds");
         var exported = await File.ReadAllTextAsync(outputPath);
@@ -841,7 +979,7 @@ static async Task TestExportCancellationAsync()
         var method = typeof(ClaudeSessionService).GetMethod("ExportSessionJsonlAsync", BindingFlags.Instance | BindingFlags.NonPublic)
             ?? throw new InvalidOperationException("Export method not found.");
         var export = (Task<string>)method.Invoke(new ClaudeSessionService(),
-            [format, sessionPath, true, false, true, null, outputPath, progress, cancellation.Token])!;
+            [format, sessionPath, new SessionExportOptions(true, false, true), null, outputPath, progress, cancellation.Token])!;
         try
         {
             await export;
@@ -867,7 +1005,7 @@ static async Task TestImageSourcesAsync()
             {"type":"user","message":{"role":"user","content":[{"type":"image","source":{"type":"url","url":"https://example.com/image%20name%20(one).png"}}]}}
             """);
         var service = new ClaudeSessionService();
-        var job = service.StartExportJob(format, sessionPath, true, inline, false, fixture.Root, null);
+        var job = service.StartExportJob(format, sessionPath, new(true, inline, false), fixture.Root, null);
         var status = await WaitForExportAsync(() => service.GetExportJobStatus(job.JobId));
         AssertEqual("success", status.Kind, "native URL image exports");
         AssertContains("https://example.com/image%20name%20%28one%29.png", await File.ReadAllTextAsync(status.OutputPath!), "URL is safe in an image link");
@@ -875,7 +1013,7 @@ static async Task TestImageSourcesAsync()
         var invalidPath = fixture.WriteSession("""
             {"type":"user","message":{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"invalid!"}}]}}
             """, "invalid-image.jsonl");
-        var invalidJob = service.StartExportJob(format, invalidPath, true, inline, false, fixture.Root, null);
+        var invalidJob = service.StartExportJob(format, invalidPath, new(true, inline, false), fixture.Root, null);
         var invalidStatus = await WaitForExportAsync(() => service.GetExportJobStatus(invalidJob.JobId));
         AssertEqual("error", invalidStatus.Kind, "invalid image data is reported");
         AssertContains("base64", invalidStatus.Message, "image error identifies invalid data");
@@ -913,7 +1051,7 @@ static async Task TestHtmlExportInlineImagesAsync()
 
     var outputPath = Path.Combine(fixture.Root, "session.html");
     var service = new ClaudeSessionService();
-    var job = service.StartExportJob("html", sessionPath, includeImages: true, inlineImages: true, includeToolCallResults: false, outputDirectory: null, outputPath);
+    var job = service.StartExportJob("html", sessionPath, new(true, true, false), outputDirectory: null, outputPath);
     var status = await WaitForExportAsync(() => service.GetExportJobStatus(job.JobId));
 
     AssertEqual("success", status.Kind, "html export status");
@@ -940,16 +1078,12 @@ static async Task TestBatchExportNamingAndCollisionAsync()
     var jobOne = service.StartBatchExportJob(
         "markdown",
         [new BatchExportSessionRequest(sessionPath, "Quarter: report / alpha", "2026-03-16T12:00:00.000+02:00")],
-        includeImages: false,
-        inlineImages: false,
-        includeToolCallResults: false,
+        new(false, false, false),
         outputDirectory);
     var jobTwo = service.StartBatchExportJob(
         "markdown",
         [new BatchExportSessionRequest(sessionPath, "Quarter: report / alpha", "2026-03-16T12:00:00.000+02:00")],
-        includeImages: false,
-        inlineImages: false,
-        includeToolCallResults: false,
+        new(false, false, false),
         outputDirectory);
     var statuses = await Task.WhenAll(
         WaitForBatchExportAsync(() => service.GetBatchExportJobStatus(jobOne.JobId)),
@@ -980,9 +1114,7 @@ static async Task TestBatchExportAssetCollisionsAsync()
     var externalJob = service.StartBatchExportJob(
         "markdown",
         [new BatchExportSessionRequest(sessionPath, "Assets", "2026-03-16T12:00:00.000Z")],
-        includeImages: true,
-        inlineImages: false,
-        includeToolCallResults: false,
+        new(true, false, false),
         outputDirectory);
     var externalStatus = await WaitForBatchExportAsync(() => service.GetBatchExportJobStatus(externalJob.JobId));
 
@@ -992,9 +1124,7 @@ static async Task TestBatchExportAssetCollisionsAsync()
     var noAssetsJob = service.StartBatchExportJob(
         "markdown",
         [new BatchExportSessionRequest(sessionPath, "Assets", "2026-03-16T12:00:00.000Z")],
-        includeImages: false,
-        inlineImages: false,
-        includeToolCallResults: false,
+        new(false, false, false),
         outputDirectory);
     var noAssetsStatus = await WaitForBatchExportAsync(() => service.GetBatchExportJobStatus(noAssetsJob.JobId));
 
@@ -1039,7 +1169,7 @@ static async Task TestBatchExportPartialFailureAsync()
         new BatchExportSessionRequest(missingPath, "Missing", null),
         new BatchExportSessionRequest(sessionPath, "Working Session", "2026-03-16T12:00:00.000Z")
     };
-    var job = service.StartBatchExportJob("html", requests, includeImages: false, inlineImages: true, includeToolCallResults: false, outputDirectory);
+    var job = service.StartBatchExportJob("html", requests, new(false, true, false), outputDirectory);
     var status = await WaitForBatchExportAsync(() => service.GetBatchExportJobStatus(job.JobId));
 
     AssertEqual("partial", status.Kind, "partial batch status");

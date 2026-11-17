@@ -227,6 +227,7 @@ public sealed partial class ClaudeSessionService
         }
 
         var interactions = 0;
+        ClaudeUserRowKind? previousUserRow = null;
         var toolCalls = 0;
         var usageByMessage = new Dictionary<string, SessionTokenUsageRecord>();
         long largestParsedLine = 0;
@@ -247,7 +248,7 @@ public sealed partial class ClaudeSessionService
                 continue;
             }
 
-            if (IsHumanClaudeUserMessage(evt.Record))
+            if (IsHumanClaudeUserMessage(evt.Record, ref previousUserRow))
             {
                 interactions++;
             }
@@ -433,9 +434,7 @@ public sealed partial class ClaudeSessionService
     public JobStartResult StartExportJob(
         string format,
         string sessionFilePath,
-        bool includeImages,
-        bool inlineImages,
-        bool includeToolCallResults,
+        SessionExportOptions options,
         string? outputDirectory,
         string? outputPath)
     {
@@ -453,7 +452,7 @@ public sealed partial class ClaudeSessionService
         {
             try
             {
-                var path = await ExportSessionJsonlAsync(format, sessionFilePath, includeImages, inlineImages, includeToolCallResults, outputDirectory, outputPath, progress => SetExportStatus(jobId, progress), record.Cancellation.Token);
+                var path = await ExportSessionJsonlAsync(format, sessionFilePath, options, outputDirectory, outputPath, progress => SetExportStatus(jobId, progress), record.Cancellation.Token);
                 SetExportStatus(jobId, new ExportJobStatus("success", 100, "done", $"{GetExportFormatLabel(format)} written to {path}", path));
             }
             catch (OperationCanceledException)
@@ -474,9 +473,7 @@ public sealed partial class ClaudeSessionService
     public JobStartResult StartBatchExportJob(
         string format,
         IReadOnlyList<BatchExportSessionRequest> sessions,
-        bool includeImages,
-        bool inlineImages,
-        bool includeToolCallResults,
+        SessionExportOptions options,
         string outputDirectory)
     {
         ValidateExportFormat(format);
@@ -504,7 +501,7 @@ public sealed partial class ClaudeSessionService
 
                 resolvedOutputDirectory = ResolveFilesystemPath(outputDirectory);
                 Directory.CreateDirectory(resolvedOutputDirectory);
-                var needsExternalAssets = ExportNeedsExternalAssets(format, includeImages, inlineImages);
+                var needsExternalAssets = ExportNeedsExternalAssets(format, options);
 
                 for (var index = 0; index < batch.Length; index++)
                 {
@@ -529,7 +526,7 @@ public sealed partial class ClaudeSessionService
                         }
 
                         Report(new ExportJobStatus("working", 0, "exporting", "", null));
-                        await ExportSessionJsonlAsync(format, session.SessionFilePath, includeImages, inlineImages, includeToolCallResults, null, outputPath, Report, record.Cancellation.Token);
+                        await ExportSessionJsonlAsync(format, session.SessionFilePath, options, null, outputPath, Report, record.Cancellation.Token);
                         succeeded++;
                     }
                     catch (OperationCanceledException)
@@ -1077,8 +1074,8 @@ public sealed partial class ClaudeSessionService
         => format == OpenCodeExportFormat ? "OpenCode session file" : ToTitleCase(format);
 
     // Markdown and HTML with linked images write an asset folder next to the export; an OpenCode session file embeds its images.
-    private static bool ExportNeedsExternalAssets(string format, bool includeImages, bool inlineImages)
-        => includeImages && (format == "markdown" || format == "html" && !inlineImages);
+    private static bool ExportNeedsExternalAssets(string format, SessionExportOptions options)
+        => options.IncludeImages && (format == "markdown" || format == "html" && !options.InlineImages);
 
     private static void ValidateExportFormat(string format)
     {
@@ -1091,9 +1088,7 @@ public sealed partial class ClaudeSessionService
     private async Task<string> ExportSessionJsonlAsync(
         string format,
         string inputPath,
-        bool includeImages,
-        bool inlineImages,
-        bool includeToolCallResults,
+        SessionExportOptions options,
         string? outputDirectory,
         string? outputPath,
         Action<ExportJobStatus> progress,
@@ -1111,20 +1106,19 @@ public sealed partial class ClaudeSessionService
             : Path.GetDirectoryName(ResolveFilesystemPath(outputPath!))!;
         Directory.CreateDirectory(directory);
         var resolvedOutputPath = automaticPath
-            ? CreateAvailableExportPath(directory, $"{Path.GetFileNameWithoutExtension(sessionFilePath)}{GetExportFileSuffix(format)}", ExportNeedsExternalAssets(format, includeImages, inlineImages), cancellationToken)
+            ? CreateAvailableExportPath(directory, $"{Path.GetFileNameWithoutExtension(sessionFilePath)}{GetExportFileSuffix(format)}", ExportNeedsExternalAssets(format, options), cancellationToken)
             : isOpenCode ? ResolveFilesystemPath(outputPath!)
             : isHtml ? EnsureHtmlOutputPath(ResolveFilesystemPath(outputPath!)) : EnsureMarkdownOutputPath(ResolveFilesystemPath(outputPath!));
         var temporaryPath = Path.Combine(directory, $".clodlogs-{Guid.NewGuid():N}.tmp");
         var imageContext = new ExportImageContext(
             isHtml ? ExportImageRenderMode.Html : ExportImageRenderMode.Markdown,
-            includeImages && !isOpenCode, inlineImages, directory, $"{Path.GetFileNameWithoutExtension(resolvedOutputPath)}-assets");
+            options.IncludeImages && !isOpenCode, options.InlineImages, directory, $"{Path.GetFileNameWithoutExtension(resolvedOutputPath)}-assets");
         var openCode = isOpenCode
             ? new OpenCodeSessionConverter(
                 meta.Id,
                 meta.Cwd,
                 new DateTimeOffset(File.GetLastWriteTimeUtc(sessionFilePath)).ToUnixTimeMilliseconds(),
-                includeImages,
-                includeToolCallResults)
+                options)
             : null;
         try
         {
@@ -1150,7 +1144,7 @@ public sealed partial class ClaudeSessionService
                 }
                 else if (isHtml)
                 {
-                    await writer.WriteAsync(BuildHtmlExportPrefix(sessionFilePath, meta, includeImages, inlineImages, includeToolCallResults));
+                    await writer.WriteAsync(BuildHtmlExportPrefix(sessionFilePath, meta, options));
                 }
                 else
                 {
@@ -1164,8 +1158,9 @@ public sealed partial class ClaudeSessionService
                     await writer.WriteLineAsync($"- CLI Version: {meta.CliVersion ?? "unknown"}");
                     await writer.WriteLineAsync($"- Source: {meta.Source ?? "unknown"}");
                     await writer.WriteLineAsync($"- Model Provider: {meta.ModelProvider ?? "unknown"}");
-                    await writer.WriteLineAsync($"- Included images: {(includeImages ? "yes" : "no")}");
-                    await writer.WriteLineAsync($"- Included tool calls and results: {(includeToolCallResults ? "yes" : "no")}");
+                    await writer.WriteLineAsync($"- Included images: {(options.IncludeImages ? "yes" : "no")}");
+                    await writer.WriteLineAsync($"- Included tool calls and results: {(options.IncludeToolCallResults ? "yes" : "no")}");
+                    await writer.WriteLineAsync($"- Included thinking: {(options.IncludeThinking ? "yes" : "no")}");
                     await writer.WriteLineAsync($"- Exported: {DateTimeOffset.Now:O}");
                     await writer.WriteLineAsync();
                     await writer.WriteLineAsync("## Transcript");
@@ -1183,10 +1178,10 @@ public sealed partial class ClaudeSessionService
                     }
                     else
                     {
-                        var built = BuildTranscriptEntries(evt.Record, transcriptCount, sawFirstUser, imageContext, includeToolCallResults);
+                        var built = BuildTranscriptEntries(evt.Record, transcriptCount, sawFirstUser, imageContext, options.IncludeToolCallResults);
                         sawFirstUser = built.SawFirstUserMessage;
                         omittedBootstrapMessages += built.OmittedBootstrapMessages;
-                        foreach (var entry in built.Entries.Where(entry => ShouldIncludeTranscriptEntry(entry, includeToolCallResults)))
+                        foreach (var entry in built.Entries.Where(entry => ShouldIncludeTranscriptEntry(entry, options)))
                         {
                             if (!isHtml && transcriptCount > 0) await writer.WriteLineAsync();
                             await writer.WriteLineAsync(isHtml ? RenderHtmlTranscriptEntry(entry) : RenderMarkdownTranscriptEntry(entry));
@@ -1749,12 +1744,16 @@ public sealed partial class ClaudeSessionService
         }
     }
 
-    private static bool ShouldIncludeTranscriptEntry(SessionTranscriptEntry entry, bool includeToolCallResults)
-        => includeToolCallResults || entry.Kind is not (
+    private static bool ShouldIncludeTranscriptEntry(SessionTranscriptEntry entry, SessionExportOptions options)
+        => entry.Kind switch
+        {
             SessionTranscriptEntryKind.ToolCall
-            or SessionTranscriptEntryKind.ToolOutput
-            or SessionTranscriptEntryKind.CustomToolCall
-            or SessionTranscriptEntryKind.CustomToolOutput);
+                or SessionTranscriptEntryKind.ToolOutput
+                or SessionTranscriptEntryKind.CustomToolCall
+                or SessionTranscriptEntryKind.CustomToolOutput => options.IncludeToolCallResults,
+            SessionTranscriptEntryKind.Reasoning => options.IncludeThinking,
+            _ => true
+        };
 
     private static string RenderMarkdownTranscriptEntry(SessionTranscriptEntry entry)
     {
@@ -1786,7 +1785,7 @@ public sealed partial class ClaudeSessionService
         """;
     }
 
-    private static string BuildHtmlExportPrefix(string sessionFilePath, SessionExportMetadata meta, bool includeImages, bool inlineImages, bool includeToolCallResults)
+    private static string BuildHtmlExportPrefix(string sessionFilePath, SessionExportMetadata meta, SessionExportOptions options)
         => $$"""
         <!doctype html>
         <html lang="en">
@@ -1822,9 +1821,10 @@ public sealed partial class ClaudeSessionService
             <span><strong>CLI Version:</strong> {{HtmlEncoder.Default.Encode(meta.CliVersion ?? "unknown")}}</span>
             <span><strong>Source:</strong> {{HtmlEncoder.Default.Encode(meta.Source ?? "unknown")}}</span>
             <span><strong>Model Provider:</strong> {{HtmlEncoder.Default.Encode(meta.ModelProvider ?? "unknown")}}</span>
-            <span><strong>Included images:</strong> {{(includeImages ? "yes" : "no")}}</span>
-            <span><strong>Inline images:</strong> {{(inlineImages ? "yes" : "no")}}</span>
-            <span><strong>Included tool calls and results:</strong> {{(includeToolCallResults ? "yes" : "no")}}</span>
+            <span><strong>Included images:</strong> {{(options.IncludeImages ? "yes" : "no")}}</span>
+            <span><strong>Inline images:</strong> {{(options.InlineImages ? "yes" : "no")}}</span>
+            <span><strong>Included tool calls and results:</strong> {{(options.IncludeToolCallResults ? "yes" : "no")}}</span>
+            <span><strong>Included thinking:</strong> {{(options.IncludeThinking ? "yes" : "no")}}</span>
             <span><strong>Exported:</strong> {{HtmlEncoder.Default.Encode(DateTimeOffset.Now.ToString("O"))}}</span>
           </div>
         </header>
@@ -1882,33 +1882,37 @@ public sealed partial class ClaudeSessionService
         return new SessionExportMetadata(Path.GetFileNameWithoutExtension(path), null, Path.GetDirectoryName(path) ?? "", null, null, "claude", null);
     }
 
-    private static bool IsHumanClaudeUserMessage(JsonObject record)
+    /// <summary>
+    /// True for a row that holds a prompt of the user. <paramref name="previousRow"/> carries the kind of a
+    /// user row to the message row after it, see <see cref="ReadClaudeUserRow"/>.
+    /// </summary>
+    private static bool IsHumanClaudeUserMessage(JsonObject record, ref ClaudeUserRowKind? previousRow)
     {
-        if (GetString(record, "type") != "user")
-        {
-            return false;
-        }
-
-        var message = record["message"] as JsonObject;
-        if (GetString(message, "role") != "user")
-        {
-            return false;
-        }
-
-        // Rows that Claude Code or the host wrote are not prompts of the user.
-        if (GetBoolean(record, "isMeta") || GetBoolean(record, "isCompactSummary") || IsClaudeHostTurn(record))
+        // Rows of a subagent and rows that repeat conversation content are not part of the conversation.
+        if (record["message"] is not JsonObject message || !IsClaudeTranscriptRecord(record) || GetBoolean(record, "isSidechain"))
         {
             return false;
         }
 
         // Claude Code writes a typed prompt either as plain text or as a list of content blocks.
-        var text = message?["content"] switch
+        var texts = GetString(record, "type") != "user" || GetString(message, "role") != "user"
+            ? []
+            : message["content"] switch
+            {
+                JsonArray content => ReadClaudeTextBlocks(content),
+                JsonValue value when value.TryGetValue<string>(out var plainText) && !string.IsNullOrWhiteSpace(plainText) => [plainText],
+                _ => []
+            };
+        if (texts.Count == 0)
         {
-            JsonArray content => ExtractClaudeTextContent(content),
-            JsonValue value when value.TryGetValue<string>(out var plainText) => plainText,
-            _ => ""
-        };
-        return !string.IsNullOrWhiteSpace(text) && !LooksLikeBootstrapContext(text) && !IsClaudeTaskNotification(record, text);
+            previousRow = null;
+            return false;
+        }
+
+        // A prompt is counted by its text; a row that holds only an image is not.
+        var row = ReadClaudeUserRow(record, texts, hasImages: false, previousRow);
+        previousRow = row.Kind;
+        return row.Kind is ClaudeUserRowKind.Prompt or ClaudeUserRowKind.SlashCommand && !LooksLikeBootstrapContext(row.Text);
     }
 
     private static int CountClaudeToolUses(JsonObject record)
@@ -2363,32 +2367,6 @@ public sealed partial class ClaudeSessionService
         var messageText = string.Join("\n\n", textChunks);
         var body = string.Join(isHtml ? "" : "\n\n", renderedChunks);
         return new RenderedMessageContent(messageText, body, isHtml ? "html" : "markdown", hasImages);
-    }
-
-    private static string ExtractClaudeTextContent(JsonArray content)
-    {
-        var chunks = new List<string>();
-        foreach (var item in content)
-        {
-            if (item is JsonValue value && value.TryGetValue<string>(out var text))
-            {
-                chunks.Add(text);
-                continue;
-            }
-
-            var part = item as JsonObject;
-            if (part is null || LooksLikeImageContentPart(part))
-            {
-                continue;
-            }
-
-            if (GetString(part, "type") == "text" && GetString(part, "text") is { } partText)
-            {
-                chunks.Add(partText);
-            }
-        }
-
-        return StripImagePlaceholderTags(string.Join("\n\n", chunks.Select(c => c.Trim()).Where(c => c.Length > 0)));
     }
 
     private static string? GetMessageContentText(JsonObject part)

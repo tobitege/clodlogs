@@ -63,7 +63,7 @@ Current desktop app highlights:
 
 - scans Claude project JSONL logs from `~/.claude/projects` or `%CLAUDE_HOME%\projects`
 - filters by current folder tree or repo root and can include cross-session writes
-- exports selected sessions to Markdown, HTML or an OpenCode 2 session file
+- exports selected sessions to Markdown, HTML or an OpenCode 2 session file, with options for images, tool calls and thinking
 - batch exports filtered sessions with collision-safe file naming
 - summarizes Claude message usage for one selected session or all currently filtered sessions
 - shows environment status for Claude home access, `git`, and `rg`
@@ -96,16 +96,31 @@ Import the file in OpenCode in one of two ways:
 What the file contains:
 
 - each prompt as a user message; with `Include images`, its images are embedded as attachments
-- each model response as an assistant message with its thinking and text, under the Claude model name and the provider `anthropic`, with its token counts
+- each model response as an assistant message with its text, under the Claude model name and the provider `anthropic`, with its token counts; with `Include thinking`, also its thinking
 - with `Include tool calls and tool outputs`, each tool call with its input and result; a failed call keeps its error, and a call without a recorded result is marked as failed
 - an idle marker at the end of each turn, with the outcome `succeeded`, `failed` or `interrupted`
-- text that Claude Code added for the model, such as command caveats or host events, as a synthetic message
-- with `Include tool calls and tool outputs`, each notification about a finished background task as a synthetic message; without the option these notifications are left out, like the tool calls they belong to
+- text that Claude Code or the host added for the model, such as a reminder, a re-sent loop prompt, hook feedback or a host event, as a synthetic message; a reminder in front of a typed prompt is split off from the prompt
+- a slash command of the user as it was typed, for example `/loop 10m check the build`
 - a compaction summary where Claude Code compacted the conversation
 - the session title (the custom title, else the generated title, else the first prompt), the start time and the token totals
 
+Some text only makes sense together with the tool calls and follows the option `Include tool calls and tool outputs`. With the option it is written as a synthetic message; without the option it is left out:
+
+- a notification about a finished background task and a message from another session or a subagent
+- the text of a loaded skill and the expansion of a slash command
+- the note about the scale of a screenshot (`[Image: original 2082x1504, displayed at ...]`)
+
+Rows that only served Claude Code's own interface are always left out:
+
+- the marker `[Request interrupted by user]`; the idle marker of the turn has the outcome `interrupted`
+- commands that Claude Code ran itself, such as `/model` or `/compact`, with their caveat and their output
+- the placeholder answer `No response requested.`
+- the message of a failed API request, such as a usage limit or an overloaded server; the turn has the outcome `failed`
+- the note with the temporary path of a pasted image, the resume marker `Continue from where you left off.` and the list of tools used before a compaction
+
 Notes:
 
+- the references that the tool search returns are written as one line, `Loaded tools: A, B`
 - include tool calls and tool outputs when the session is meant to be continued; without them OpenCode sees only the prompts and answers
 - only images embedded in the session are exported; image links are skipped
 - subagent rows and the API request rows of Claude Code are not part of the conversation and are left out
@@ -163,3 +178,7 @@ Notes:
 - Fixed the session list showing the session id for a session that the user named. A title set by the user now wins over the generated title.
 - Fixed the prompt count leaving out prompts that Claude Code stores as plain text, which showed `0 prompts` for such sessions.
 - A notification about a finished background task is no longer treated as a prompt of the user. In the replay and in every export format it now belongs to the tool calls: it is shown as `Background Task Notification` with them and left out without them. Such notifications and other rows that Claude Code or the host wrote no longer count as prompts.
+- Added the export option `Include thinking` for all three formats. It is off by default, so the Markdown and HTML exports no longer contain the thinking of the model unless the option is set.
+- The OpenCode export leaves out what only served Claude Code's own interface: interruption markers, commands that Claude Code ran itself (such as `/model`) with their output, the placeholder answer `No response requested.`, the messages of failed API requests, notes with the temporary path of a pasted image and resume markers. Interrupted and failed turns keep their outcome in the idle marker.
+- In the OpenCode export, the text of a loaded skill, the expansion of a slash command, notes about the scale of a screenshot and messages from other sessions now follow the option for tool calls. A slash command of the user is written as typed, a reminder in front of a typed prompt becomes injected text, and the references of the tool search become one line.
+- Fixed the prompt count including interruption markers, commands that Claude Code ran itself with their output, reminders of the host without a prompt and the prompts of subagents.

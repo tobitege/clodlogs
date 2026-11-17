@@ -308,6 +308,7 @@
           <CheckBox Content="Include images" IsChecked="{CompiledBinding ExportImages, Mode=TwoWay}" />
           <CheckBox Content="Inline images in HTML" IsChecked="{CompiledBinding ExportInlineImages, Mode=TwoWay}" />
           <CheckBox Content="Include tool calls and tool outputs" IsChecked="{CompiledBinding ExportToolCallResults, Mode=TwoWay}" />
+          <CheckBox Content="Include thinking" IsChecked="{CompiledBinding ExportThinking, Mode=TwoWay}" />
           <WrapPanel HorizontalAlignment="Right">
             <Button Classes="primary" Content="Start Export" Command="{CompiledBinding ConfirmExportCommand}" />
             <Button Classes="ghost" Content="Cancel" Command="{CompiledBinding DismissDialogsCommand}" />
@@ -338,6 +339,7 @@
               <CheckBox Content="Include images" IsChecked="{CompiledBinding ExportImages, Mode=TwoWay}" />
               <CheckBox Content="Inline images in HTML" IsChecked="{CompiledBinding ExportInlineImages, Mode=TwoWay}" />
               <CheckBox Content="Include tool calls and tool outputs" IsChecked="{CompiledBinding ExportToolCallResults, Mode=TwoWay}" />
+              <CheckBox Content="Include thinking" IsChecked="{CompiledBinding ExportThinking, Mode=TwoWay}" />
             </WrapPanel>
             <TextBlock Classes="muted" Text="{CompiledBinding ExportFormatHint}" IsVisible="{CompiledBinding ExportFormatHintVisible}" TextWrapping="Wrap" />
           </StackPanel>
