@@ -1,7 +1,9 @@
 ﻿using System.Text;
+using System.Globalization;
 using System.Reflection;
 using System.Text.Json.Nodes;
 using Avalonia;
+using Clodlogs.Desktop.Cli;
 using Clodlogs.Desktop.Models;
 using Clodlogs.Desktop.Services;
 using Clodlogs.Desktop.ViewModels;
@@ -49,6 +51,10 @@ var tests = new List<(string Name, Func<Task> Run)>
     ("session scan reads many files and keeps every session", TestParallelSessionScanAsync),
     ("session list prefers the title set by the user", TestSessionTitlesAsync),
     ("refresh scan reports progress and clears stale results", TestRefreshScanReportsProgressAsync),
+    ("cli recognizes its commands and leaves other arguments to the app", TestCliCommandDetection),
+    ("cli list filters by time window, project, title, limit and subagents", TestCliListFiltersAsync),
+    ("cli export writes selected sessions without replacing files", TestCliExportAsync),
+    ("cli reports unknown sessions and invalid arguments", TestCliErrorsAsync),
     // Keep this one last: it installs Avalonia's synchronization context, which no message loop serves here.
     ("native rendering packages shape text and encode PNG through Avalonia", TestNativeRendering)
 };
@@ -1485,6 +1491,199 @@ static async Task<TokenUsageSummaryJobStatus> WaitForTokenSummaryAsync(Func<Toke
     }
 
     throw new TimeoutException("Timed out waiting for token summary completion.");
+}
+
+static Task TestCliCommandDetection()
+{
+    foreach (var command in new[] { "list", "export", "EXPORT", "help", "--help", "-h", "/?", "--version" })
+    {
+        AssertTrue(ClodlogsCli.IsCommand([command, "--json"]), $"'{command}' runs the command line");
+    }
+
+    AssertTrue(!ClodlogsCli.IsCommand([]), "no arguments open the app");
+    AssertTrue(!ClodlogsCli.IsCommand([@"C:\repo"]), "a folder argument opens the app");
+    return Task.CompletedTask;
+}
+
+// Three sessions and one subagent transcript; the clock of the CLI stands at 2026-11-20T20:00Z.
+static string WriteCliFixture(TempFixture fixture)
+{
+    var repoA = Path.Combine(fixture.Root, "repoA");
+    var repoB = Path.Combine(fixture.Root, "repoB");
+    Directory.CreateDirectory(repoA);
+    Directory.CreateDirectory(repoB);
+    string Session(string id, string cwd, string start, string end, string? title) => $$$"""
+        {"type":"user","sessionId":"{{{id}}}","cwd":{{{JsonValue.Create(cwd).ToJsonString()}}},"timestamp":"{{{start}}}","message":{"role":"user","content":"prompt {{{id}}}"}}
+        {"type":"assistant","sessionId":"{{{id}}}","timestamp":"{{{end}}}","message":{"role":"assistant","content":[{"type":"text","text":"answer {{{id}}}"},{"type":"tool_use","id":"call-{{{id}}}","name":"Bash","input":{"command":"TOOL-{{{id}}}"}}]}}
+        {"type":"tools-used","tools":["Bash"],"sessionId":"{{{id}}}"}
+        """ + (title is null ? "" : $$$"""
+
+        {"type":"ai-title","sessionId":"{{{id}}}","aiTitle":"{{{title}}}"}
+        """);
+    var projects = Path.Combine(".claude", "projects");
+    // Each file was last written at its last activity, as Claude Code does.
+    void Write(string id, string cwd, string start, string end, string? title, string path)
+        => File.SetLastWriteTimeUtc(
+            fixture.WriteSession(Session(id, cwd, start, end, title), path),
+            DateTime.Parse(end, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal));
+    Write("aaaa1111", repoA, "2026-11-20T17:00:00.000Z", "2026-11-20T19:30:00.000Z", "Recent work", Path.Combine(projects, "repoA", "aaaa1111.jsonl"));
+    Write("aaaa2222", repoB, "2026-11-20T10:00:00.000Z", "2026-11-20T11:00:00.000Z", "Older work", Path.Combine(projects, "repoB", "aaaa2222.jsonl"));
+    Write("bbbb3333", repoA, "2026-11-19T12:00:00.000Z", "2026-11-19T12:30:00.000Z", "Yesterday work", Path.Combine(projects, "repoA", "bbbb3333.jsonl"));
+    Write("aaaa1111", repoA, "2026-11-20T19:40:00.000Z", "2026-11-20T19:45:00.000Z", null, Path.Combine(projects, "repoA", "aaaa1111", "subagents", "agent-x.jsonl"));
+    return Path.Combine(fixture.Root, ".claude");
+}
+
+static async Task<(int Exit, string Output, string Error)> RunCliAsync(string root, string claudeHome, params string[] args)
+{
+    var output = new StringWriter();
+    var error = new StringWriter();
+    var cli = new ClodlogsCli(
+        new ClaudeSessionService(),
+        output,
+        error,
+        root,
+        () => DateTimeOffset.Parse("2026-11-20T20:00:00Z", CultureInfo.InvariantCulture),
+        TimeZoneInfo.Utc);
+    var exit = await cli.RunAsync([.. args, "--claude-home", claudeHome]);
+    return (exit, output.ToString(), error.ToString());
+}
+
+static async Task<string> CliListIdsAsync(string root, string claudeHome, params string[] filters)
+{
+    var result = await RunCliAsync(root, claudeHome, ["list", "--json", .. filters]);
+    AssertEqual(0, result.Exit, $"list {string.Join(' ', filters)} exit code ({result.Error})");
+    var sessions = JsonNode.Parse(result.Output)!.AsArray();
+    return string.Join(",", sessions.Select(session => $"{session!["id"]}{(session["subagent"]!.GetValue<bool>() ? "/subagent" : "")}"));
+}
+
+static async Task TestCliListFiltersAsync()
+{
+    using var fixture = new TempFixture();
+    var home = WriteCliFixture(fixture);
+    var root = fixture.Root;
+
+    AssertEqual("aaaa1111,aaaa2222,bbbb3333", await CliListIdsAsync(root, home), "all sessions, newest first, without subagents");
+    // The recent session started three hours ago but was active within the last hour.
+    AssertEqual("aaaa1111", await CliListIdsAsync(root, home, "--since", "1h"), "active in the last hour");
+    AssertEqual("aaaa1111/subagent,aaaa1111", await CliListIdsAsync(root, home, "--since", "1h", "--include-subagents"), "subagents on request");
+    AssertEqual("bbbb3333", await CliListIdsAsync(root, home, "--from", "2026-11-19", "--to", "2026-11-19"), "a whole day");
+    AssertEqual("aaaa2222", await CliListIdsAsync(root, home, "--since", "2026-11-20T10:30", "--until", "2026-11-20T12:00"), "overlapping a time range");
+    AssertEqual("aaaa1111", await CliListIdsAsync(root, home, "--since=3h30m", "--until=2h"), "combined durations");
+    AssertEqual("aaaa1111,bbbb3333", await CliListIdsAsync(root, home, "--project", "repoA"), "relative project folder");
+    AssertEqual("aaaa2222", await CliListIdsAsync(root, home, "--match", "OLDER"), "title match ignores case");
+    AssertEqual("aaaa1111", await CliListIdsAsync(root, home, "--limit", "1"), "limit keeps the newest");
+    AssertEqual("aaaa2222,bbbb3333", await CliListIdsAsync(root, home, "-s", "bbbb,aaaa2222"), "several sessions by prefix and id");
+
+    var human = await RunCliAsync(root, home, "list", "--project", "repoA");
+    AssertContains("2026-11-20 19:30  aaaa1111", human.Output, "human list shows the last activity and the short id");
+    AssertContains("Recent work", human.Output, "human list shows the title");
+    AssertContains("2 sessions.", human.Output, "human list counts the sessions");
+    AssertContains("No sessions matched.", (await RunCliAsync(root, home, "list", "--since", "5m")).Output, "empty window");
+    // A time with an offset is an instant, with or without the T and whatever the zone of the machine.
+    AssertEqual("aaaa2222", await CliListIdsAsync(root, home, "--since", "2026-11-20 10:30 +00:00", "--until", "2026-11-20T13:00+01:00"), "times with offsets");
+
+    // Files not written since the start of the window are not read at all.
+    var scan = await new ClaudeSessionService().FindClaudeSessionsAsync(home, null, false, null, null, false,
+        modifiedSince: DateTimeOffset.Parse("2026-11-20T19:00:00Z", CultureInfo.InvariantCulture));
+    AssertEqual(2, scan.TotalFileCount, "only the files written in the window are scanned");
+    File.SetLastWriteTimeUtc(Path.Combine(home, "projects", "repoA", "aaaa1111.jsonl"), new DateTime(2026, 11, 20, 18, 0, 0, DateTimeKind.Utc));
+    AssertEqual("", await CliListIdsAsync(root, home, "--since", "1h"), "--since skips files by their write time");
+    // A named session outside the window is known, just not active in it.
+    AssertEqual("", await CliListIdsAsync(root, home, "-s", "bbbb3333", "--since", "1h"), "a named session outside the window is no error");
+}
+
+static async Task TestCliExportAsync()
+{
+    using var fixture = new TempFixture();
+    var home = WriteCliFixture(fixture);
+    var root = fixture.Root;
+    var output = Path.Combine(root, "out");
+
+    var result = await RunCliAsync(root, home, "export", "--since", "1h", "--out", "out", "-f", "md,html", "--tool-calls");
+    AssertEqual(0, result.Exit, $"export exit code ({result.Error})");
+    var markdown = Path.Combine(output, "Recent work - 2026-11-20T17-00-00.000Z.md");
+    AssertTrue(File.Exists(markdown), "markdown export is named after title and start");
+    AssertTrue(File.Exists(Path.ChangeExtension(markdown, ".html")), "html export of the same session");
+    AssertContains("TOOL-aaaa1111", await File.ReadAllTextAsync(markdown), "tool calls are included on request");
+    AssertEqual(2, Directory.GetFiles(output).Length, "only the session active in the last hour is exported");
+    AssertContains("Exported 2 files from 1 session", result.Output, "summary");
+
+    var again = await RunCliAsync(root, home, "export", "-s", "aaaa1111", "-o", output);
+    AssertEqual(0, again.Exit, "second export exit code");
+    var numbered = Path.Combine(output, "Recent work - 2026-11-20T17-00-00.000Z-2.md");
+    AssertTrue(File.Exists(numbered), "an existing export is not replaced");
+    AssertTrue(!(await File.ReadAllTextAsync(numbered)).Contains("TOOL-aaaa1111", StringComparison.Ordinal), "tool calls are left out by default");
+    AssertContains("TOOL-aaaa1111", await File.ReadAllTextAsync(markdown), "the first export is unchanged");
+
+    var subagentFile = Path.Combine(home, "projects", "repoA", "aaaa1111", "subagents", "agent-x.jsonl");
+    var byPath = await RunCliAsync(root, home, "export", "-s", subagentFile, "-o", "by-path", "-f", "opencode", "--json");
+    AssertEqual(0, byPath.Exit, $"export by path exit code ({byPath.Error})");
+    var exported = JsonNode.Parse(byPath.Output)!["exported"]!.AsArray();
+    AssertEqual(1, exported.Count, "a file path selects that file");
+    AssertTrue(File.Exists(exported[0]!["output"]!.GetValue<string>()), "the reported output exists");
+    AssertContains("agent-x - 2026-11-20T19-40-00.000Z.opencode.json", exported[0]!["output"]!.GetValue<string>(), "an untitled session is named after its file");
+
+    var dryRun = await RunCliAsync(root, home, "export", "--project", "repoA", "-o", "dry", "--dry-run", "--json");
+    AssertEqual(0, dryRun.Exit, "dry run exit code");
+    var planned = JsonNode.Parse(dryRun.Output)!;
+    AssertEqual(true, planned["dryRun"]!.GetValue<bool>(), "dry run is reported");
+    AssertEqual(2, planned["planned"]!.AsArray().Count, "dry run lists the files of both project sessions");
+    AssertTrue(planned["exported"] is null, "a dry run exports nothing");
+    AssertTrue(!Directory.Exists(Path.Combine(root, "dry")), "dry run writes nothing");
+
+    // The dry run predicts numbered names: an existing file, and Markdown and HTML sharing an asset folder name.
+    var collide = Path.Combine(root, "collide");
+    Directory.CreateDirectory(collide);
+    await File.WriteAllTextAsync(Path.Combine(collide, "Recent work - 2026-11-20T17-00-00.000Z.html"), "existing");
+    string[] collisionArgs = ["export", "-s", "aaaa1111,bbbb3333", "-o", collide, "-f", "md,html,opencode", "--images", "--json"];
+    var prediction = await RunCliAsync(root, home, [.. collisionArgs, "--dry-run"]);
+    var actual = await RunCliAsync(root, home, collisionArgs);
+    AssertEqual(0, actual.Exit, $"collision export exit code ({actual.Error})");
+    var predicted = JsonNode.Parse(prediction.Output)!["planned"]!.ToJsonString();
+    AssertEqual(JsonNode.Parse(actual.Output)!["exported"]!.ToJsonString(), predicted, "the dry run predicts the written files");
+    AssertContains("Recent work - 2026-11-20T17-00-00.000Z-2.html", predicted, "an existing file gets a numbered name");
+}
+
+static async Task TestCliErrorsAsync()
+{
+    using var fixture = new TempFixture();
+    var home = WriteCliFixture(fixture);
+    var root = fixture.Root;
+
+    var ambiguous = await RunCliAsync(root, home, "export", "-s", "aaaa", "-o", "out");
+    AssertEqual(1, ambiguous.Exit, "ambiguous prefix exit code");
+    AssertContains("ambiguous", ambiguous.Error, "ambiguous prefix message");
+    AssertContains("aaaa2222", ambiguous.Error, "ambiguous prefix lists the candidates");
+    var unknown = await RunCliAsync(root, home, "export", "-s", "zzzz", "-o", "out");
+    AssertEqual(1, unknown.Exit, "unknown session exit code");
+    AssertContains("no session matches 'zzzz'", unknown.Error, "unknown session message");
+    AssertTrue(!Directory.Exists(Path.Combine(root, "out")), "nothing is exported when a session is unknown");
+
+    foreach (var args in new string[][]
+    {
+        ["list", "--out", "x"],
+        ["list", "--cwd-only"],
+        ["list", "--since", "yesterday"],
+        ["list", "--since", "1h", "--until", "2h"],
+        ["list", "--limit", "0"],
+        ["list", "--session"],
+        ["list", "stray"],
+        ["export", "-f", "pdf"],
+        ["export", "--bogus"],
+        ["export", "--tool-calls=false"],
+        ["list", "--json=1"],
+        ["list", "--since", "99999999w"],
+        ["list", "--until", "9999-12-31T23:59:59-05:00"]
+    })
+    {
+        var invalid = await RunCliAsync(root, home, args);
+        AssertEqual(2, invalid.Exit, $"'{string.Join(' ', args)}' is a usage error");
+        AssertContains("clodlogs: ", invalid.Error, $"'{string.Join(' ', args)}' explains the error");
+    }
+
+    var help = await RunCliAsync(root, home, "help");
+    AssertEqual(0, help.Exit, "help exit code");
+    AssertContains("clodlogs export [filters]", help.Output, "help shows the usage");
 }
 
 static void AssertEqual<T>(T expected, T actual, string label)

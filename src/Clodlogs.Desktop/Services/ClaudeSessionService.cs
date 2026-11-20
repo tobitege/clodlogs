@@ -48,7 +48,8 @@ public sealed partial class ClaudeSessionService
         bool includeCrossSessionWrites,
         string? currentWorkingDirectory = null,
         IProgress<SessionScanProgress>? progress = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        DateTimeOffset? modifiedSince = null)
     {
         var currentDirectory = Path.GetFullPath(currentWorkingDirectory ?? Environment.CurrentDirectory);
         var resolvedClaudeHome = ResolveFilesystemPath(
@@ -88,7 +89,11 @@ public sealed partial class ClaudeSessionService
                         break;
                     }
 
-                    files.Add(file);
+                    // A file written last before the cutoff holds no activity after it, so it is not read at all.
+                    if (modifiedSince is null || File.GetLastWriteTimeUtc(file) >= modifiedSince.Value.UtcDateTime)
+                    {
+                        files.Add(file);
+                    }
                 }
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -501,19 +506,14 @@ public sealed partial class ClaudeSessionService
 
                 resolvedOutputDirectory = ResolveFilesystemPath(outputDirectory);
                 Directory.CreateDirectory(resolvedOutputDirectory);
-                var needsExternalAssets = ExportNeedsExternalAssets(format, options);
 
                 for (var index = 0; index < batch.Length; index++)
                 {
                     record.Cancellation.Token.ThrowIfCancellationRequested();
                     var session = batch[index];
-                    string? outputPath = null;
                     try
                     {
-                        var proposedName = BuildBatchExportFileName(session.SessionName, session.StartedAt, format);
-                        outputPath = CreateAvailableExportPath(resolvedOutputDirectory, proposedName, needsExternalAssets, record.Cancellation.Token);
-                        var displayName = Path.GetFileName(outputPath);
-                        void Report(ExportJobStatus status)
+                        void Report(string displayName, ExportJobStatus status)
                         {
                             var progress = Math.Clamp((int)Math.Round((index + status.ProgressPercent / 100d) / batch.Length * 100), 1, 99);
                             SetBatchExportStatus(jobId, new BatchExportJobStatus(
@@ -525,19 +525,11 @@ public sealed partial class ClaudeSessionService
                                 null));
                         }
 
-                        Report(new ExportJobStatus("working", 0, "exporting", "", null));
-                        await ExportSessionJsonlAsync(format, session.SessionFilePath, options, null, outputPath, Report, record.Cancellation.Token);
+                        await ExportSessionToDirectoryAsync(format, session, options, resolvedOutputDirectory, Report, record.Cancellation.Token);
                         succeeded++;
                     }
-                    catch (OperationCanceledException)
+                    catch (Exception ex) when (ex is not OperationCanceledException)
                     {
-                        // The zero-byte reservation may predate export setup and must always be released.
-                        if (outputPath is not null) TryDeleteFile(outputPath);
-                        throw;
-                    }
-                    catch (Exception ex)
-                    {
-                        if (outputPath is not null) TryDeleteFile(outputPath);
                         failures.Add(new BatchExportFailure(session.SessionFilePath, ex.Message));
                     }
                 }
@@ -573,6 +565,42 @@ public sealed partial class ClaudeSessionService
         });
 
         return new JobStartResult(jobId);
+    }
+
+    /// <summary>
+    /// Exports one session into <paramref name="outputDirectory"/> under its batch file name
+    /// (title and UTC start time) and returns the written path. An existing file is never replaced:
+    /// a free name with a numeric suffix is reserved instead, and the reservation is released on failure.
+    /// With <paramref name="planned"/>, the names of earlier exports of the same run count as taken (see <see cref="PlanExportPath"/>).
+    /// </summary>
+    public async Task<string> ExportSessionToDirectoryAsync(
+        string format,
+        BatchExportSessionRequest session,
+        SessionExportOptions options,
+        string outputDirectory,
+        Action<string, ExportJobStatus>? progress = null,
+        CancellationToken cancellationToken = default,
+        ISet<string>? planned = null)
+    {
+        ValidateExportFormat(format);
+        var resolvedOutputDirectory = ResolveFilesystemPath(outputDirectory);
+        Directory.CreateDirectory(resolvedOutputDirectory);
+        string? outputPath = null;
+        try
+        {
+            var proposedName = BuildBatchExportFileName(session.SessionName, session.StartedAt, format);
+            outputPath = FindExportPath(resolvedOutputDirectory, proposedName, ExportNeedsExternalAssets(format, options), planned, reserve: true, cancellationToken);
+            var displayName = Path.GetFileName(outputPath);
+            void Report(ExportJobStatus status) => progress?.Invoke(displayName, status);
+            Report(new ExportJobStatus("working", 0, "exporting", "", null));
+            return await ExportSessionJsonlAsync(format, session.SessionFilePath, options, null, outputPath, Report, cancellationToken);
+        }
+        catch
+        {
+            // The zero-byte reservation may predate export setup and must always be released.
+            if (outputPath is not null) TryDeleteFile(outputPath);
+            throw;
+        }
     }
 
     public ExportJobStatus GetExportJobStatus(string jobId)
@@ -1442,6 +1470,16 @@ public sealed partial class ClaudeSessionService
         }
     }
 
+    /// <summary>Reads the list metadata of one session file, or null when it is not a readable session.</summary>
+    public async Task<SessionMetaMatch?> ReadSessionMetaAsync(string sessionFilePath, CancellationToken cancellationToken = default)
+    {
+        var path = ResolveFilesystemPath(sessionFilePath);
+        var probe = await ProbeSessionFileAsync(path, cancellationToken);
+        return probe is null
+            ? null
+            : new SessionMetaMatch(SessionKind.Live, probe.Id, path, probe.FileSizeBytes, probe.Cwd, probe.StartedAt, probe.UpdatedAt, probe.ThreadName, probe.Source);
+    }
+
     private async Task<SessionProbe?> ProbeSessionFileAsync(string filePath, CancellationToken cancellationToken)
     {
         try
@@ -2275,7 +2313,36 @@ public sealed partial class ClaudeSessionService
         string proposedName,
         bool needsExternalAssets,
         CancellationToken cancellationToken)
+        => FindExportPath(outputDirectory, proposedName, needsExternalAssets, null, reserve: true, cancellationToken);
+
+    /// <summary>
+    /// The path <see cref="ExportSessionToDirectoryAsync"/> writes when it gets the same <paramref name="planned"/>
+    /// set, without writing anything. The set holds the paths planned so far in the run and receives this one.
+    /// </summary>
+    public static string PlanExportPath(
+        string format,
+        BatchExportSessionRequest session,
+        SessionExportOptions options,
+        string outputDirectory,
+        ISet<string> planned)
     {
+        ValidateExportFormat(format);
+        var proposedName = BuildBatchExportFileName(session.SessionName, session.StartedAt, format);
+        return FindExportPath(ResolveFilesystemPath(outputDirectory), proposedName, ExportNeedsExternalAssets(format, options), planned, reserve: false, CancellationToken.None);
+    }
+
+    // Tries the proposed name, then the same name with -2, -3, ... before the extension. A name is taken by an
+    // existing file or folder, by its asset folder when the export writes one, or by an earlier name of the run.
+    // The planned asset folder counts even when the session has no images, so the names never depend on the content.
+    private static string FindExportPath(
+        string outputDirectory,
+        string proposedName,
+        bool needsExternalAssets,
+        ISet<string>? planned,
+        bool reserve,
+        CancellationToken cancellationToken)
+    {
+        bool Taken(string path) => PathExists(path) || planned?.Contains(path) == true;
         var extension = Path.GetExtension(proposedName);
         var stem = Path.GetFileNameWithoutExtension(proposedName);
         for (var suffix = 1; ; suffix++)
@@ -2284,23 +2351,31 @@ public sealed partial class ClaudeSessionService
             var name = suffix == 1 ? proposedName : $"{stem}-{suffix}{extension}";
             var path = Path.Combine(outputDirectory, name);
             var assetPath = Path.Combine(outputDirectory, $"{Path.GetFileNameWithoutExtension(name)}-assets");
-            if (File.Exists(path)
-                || Directory.Exists(path)
-                || needsExternalAssets && (File.Exists(assetPath) || Directory.Exists(assetPath)))
+            if (Taken(path) || needsExternalAssets && Taken(assetPath) || reserve && !TryReserve(path))
             {
                 continue;
             }
 
-            try
-            {
-                using var reservation = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
-                return path;
-            }
-            catch (IOException) when (File.Exists(path) || Directory.Exists(path))
-            {
-            }
+            planned?.Add(path);
+            if (needsExternalAssets) planned?.Add(assetPath);
+            return path;
         }
     }
+
+    private static bool TryReserve(string path)
+    {
+        try
+        {
+            using var reservation = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+            return true;
+        }
+        catch (IOException) when (PathExists(path))
+        {
+            return false;
+        }
+    }
+
+    private static bool PathExists(string path) => File.Exists(path) || Directory.Exists(path);
 
     private static string DecodeClaudeProjectFolderPath(string folderName)
     {

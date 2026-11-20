@@ -69,6 +69,7 @@ Current desktop app highlights:
 - shows environment status for Claude home access, `git`, and `rg`
 - opens a read-only full-window session replay dialog
 - creates sanitized session copies with optional image and blob removal
+- lists and exports sessions from the command line, filtered by session, project, time window and title
 
 ## Large Session Handling
 
@@ -184,3 +185,40 @@ Notes:
 - Fixed the prompt count including interruption markers, commands that Claude Code ran itself with their output, reminders of the host without a prompt and the prompts of subagents.
 - Updated SkiaSharp and its native packages to 4.156.0.
 - Updated HarfBuzzSharp and its native packages to 14.4.0.100.
+
+### 1.2.0 - 2026-11-20
+
+- Added a command line with `clodlogs list` and `clodlogs export`. It selects sessions by id, id prefix or file, by project folder or repository, by a time window (a duration such as `1h`, dates or date and time) and by title, and exports them as Markdown, HTML or OpenCode session files into a chosen folder with the options of the export dialog. `--dry-run` shows the planned files and `--json` prints machine-readable results. The batch file `clodlogs.cmd` next to the program runs it in PowerShell and `cmd`.
+
+## Command Line
+
+The same program lists and exports sessions from the command line. Without a command it opens the desktop app.
+
+```powershell
+clodlogs list --since 1h
+clodlogs export --since 1h --out D:\exports --format markdown,html --tool-calls
+clodlogs export --project C:\github\myrepo --from 2026-11-01 --to 2026-11-15 --out D:\exports
+clodlogs export --session af32f898,9229c2f9 --format opencode --full --out D:\exports
+clodlogs help
+```
+
+`clodlogs` is the batch file `clodlogs.cmd` next to `Clodlogs.Desktop.exe`; add that folder to `PATH` to call it from anywhere. Use the batch file in PowerShell and `cmd`: the program itself is a desktop app, so these shells would not wait for it and would show the prompt before its output. Git Bash and scripts that read the output can call `Clodlogs.Desktop.exe list ...` directly. When run from source, use `dotnet run --project src\Clodlogs.Desktop\Clodlogs.Desktop.csproj -- list --since 1h`.
+
+Filters, which narrow the selection together:
+
+- `-s`, `--session ID|FILE`: a session id, a unique id prefix (`af32f898`), a file name or a `.jsonl` path, also one outside the Claude home. Repeat the option or separate several values with commas.
+- `-p`, `--project DIR`: only sessions of this folder; inside a git repository the whole repository counts. `--cwd-only` matches only the folder tree, and `--cross-session-writes` adds sessions from other folders that wrote files into the project.
+- `--since WHEN` and `--until WHEN` (or `--from` and `--to`): sessions with activity in this window. A session counts when the time from its first to its last message overlaps the window, so `--since 1h` also finds a session that started in the morning and is still running. `WHEN` is a duration back from now (`30m`, `1h`, `2d`, `1w`, `1h30m`), a date (`2026-11-20`, a whole local day; `--until` includes it) or a date and time (`2026-11-20T14:00`, local time unless it has an offset). With `--since`, session files that were not written since that time are skipped without being read, so a short window is fast.
+- `--match TEXT`: only sessions whose title contains the text, ignoring case.
+- `--limit N`: only the N most recently active sessions.
+- `--include-subagents`: also the transcripts of subagents, which are left out by default.
+- `--claude-home DIR`: a Claude home other than `%CLAUDE_HOME%` or `~/.claude`.
+
+Export options:
+
+- `-o`, `--out DIR`: the output folder, created when missing; defaults to `export` in the current folder. Each file is named after the session title and its start time in UTC, like `Fix the parser - 2026-11-20T14-03-12.000Z.md`; a session without a title is named after its file. An existing file is never replaced: the export gets a numbered name instead.
+- `-f`, `--format LIST`: `markdown` (or `md`), `html` and `opencode`, several separated by commas; defaults to `markdown`.
+- `--images`, `--inline-images` (HTML only, implies `--images`), `--tool-calls` and `--thinking` correspond to the options of the export dialog; `--full` sets images, tool calls and thinking.
+- `--dry-run` shows the files that would be written, including numbered names, and writes nothing.
+
+`--json` prints the sessions or the export result as JSON; a dry run lists its files under `planned` instead of `exported`. The exit code is `0` on success, `1` when a session was not found or an export failed, and `2` for invalid arguments.
